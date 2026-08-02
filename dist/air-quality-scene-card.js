@@ -183,10 +183,19 @@ const READING_LABELS = {
   nox: "NOx index",
 };
 
-const CARD_VERSION = "1.3.0";
+const CARD_VERSION = "1.3.1";
 
 const fmt = (v, digits = 1) =>
   v == null || Number.isNaN(v) ? "–" : Number(v).toFixed(digits).replace(/\.0$/, "");
+
+/** Escape a value for interpolation into markup. Entity friendly_name and the
+ *  card's own `name` option are freeform user text, so anything that reaches an
+ *  innerHTML template — text node or attribute value — has to go through here. */
+const esc = (s) =>
+  String(s ?? "").replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
 
 class AirQualitySceneCard extends HTMLElement {
   static getStubConfig(hass) {
@@ -262,7 +271,7 @@ class AirQualitySceneCard extends HTMLElement {
     const headline = { co2: "co2", pm25: "pm25", pm10: "pm10", voc: "voc", nox: "nox" }[key];
     if (headline) return METRICS[headline];
     const st = this._related?.[key] && this._hass.states[this._related[key]];
-    const unit = st?.attributes?.unit_of_measurement ?? READINGS[key]?.unit ?? "";
+    const unit = esc(st?.attributes?.unit_of_measurement ?? READINGS[key]?.unit ?? "");
     const base = {
       pm1: { labelHtml: "PM<sub>1</sub>", short: "PM1", decimals: 0, chartFloor: 5, categories: PM25_CATEGORIES },
       pm03: { labelHtml: "PM<sub>0.3</sub>", short: "PM0.3", decimals: 0, chartFloor: 0, color: "#5c6bc0" },
@@ -566,7 +575,7 @@ class AirQualitySceneCard extends HTMLElement {
     const avg24 = meanOfLast(fine, 24 * 3600e3);
     const avg12 = meanOfLast(fine, 12 * 3600e3);
 
-    const name = this.shadowRoot.querySelector(".name").textContent;
+    const name = esc(this.shadowRoot.querySelector(".name").textContent);
     const tile = (title, value, sub) => `
       <div class="tile">
         <div class="tile-title">${title}</div>
