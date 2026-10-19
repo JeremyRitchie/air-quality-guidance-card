@@ -1,0 +1,263 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { DEFAULT_POLICY, evaluateGuidance, normalizeReading, rollingAverage } from '../src/guidance.js';
+
+const BUCKET = 5 * 60 * 1000;
+const NOW = Date.parse('2026-10-19T12:03:00Z');
+const END = Math.floor(NOW / BUCKET) * BUCKET;
+const reading = (value, unit, extra = {}) => ({ value, unit, ...extra });
+const buckets = (mean, count = 288) => Array.from({ length: count }, (_, i) => ({ start: END - (count - i) * BUCKET, mean }));
+const evaluate = (readings, samples = {}, extra = {}) => evaluateGuidance({ now: NOW, readings, samples, ...extra });
+
+test('normal readings use neutral language and relative gas baselines', () => {
+  const result = evaluate({ pm25: reading(4, 'µg/m³'), pm10: reading(8, 'μg/m³'), co2: reading(650, 'ppm'), voc: reading(100, ''), nox: reading(1, ''), humidity: reading(45, '%') });
+  assert.equal(result.headline, 'No sensor flags');
+  assert.equal(result.severity, 0);
+  assert.equal(result.partial, false);
+  assert.equal(result.flags.length, 0);
+  assert.match(result.readings.find(r => r.key === 'nox').basis, /not gas concentrations or health exposure limits/);
+  assert.doesNotMatch(result.headline, /safe|healthy|hazard/i);
+});
+
+test('blank, nonfinite, boolean and negative values never become reassuring zeros', () => {
+  for (const value of ['', ' ', null, undefined, false, NaN, Infinity, -1, 'unknown', 'unavailable']) {
+    const result = evaluate({ pm25: reading(value, 'µg/m³') });
+    assert.equal(result.headline, 'Waiting for readings', String(value));
+    assert.equal(result.readings[0].status, 'invalid');
+  }
+  assert.equal(normalizeReading('pm25', reading('0', 'ug/m3')).value, 0);
+});
+
+test('measurement units are validated; unitless indices cannot be ppb or AQI', () => {
+  for (const [key, value, unit] of [['pm25', 12, 'ppm'], ['co2', 600, 'µg/m³'], ['voc', 150, 'ppb'], ['nox', 30, 'µg/m³'], ['humidity', 45, '°C']]) {
+    assert.equal(evaluate({ [key]: reading(value, unit) }).readings[0].status, 'invalid');
+  }
+  for (const value of [0, 501]) assert.equal(evaluate({ nox: reading(value, '') }).readings[0].status, 'invalid');
+  assert.match(evaluate({ voc: reading(0, '') }).readings[0].reason, /warming up/);
+  assert.equal(evaluate({ humidity: reading(101, '%') }).readings[0].status, 'invalid');
+});
+
+test('an unchanged HA state is not stale merely because last_updated is old', () => {
+  const old = new Date(NOW - 10 * 86400000).toISOString();
+  assert.equal(evaluate({ co2: reading(600, 'ppm', { lastUpdated: old }) }).readings[0].status, 'ok');
+  assert.equal(evaluate({ co2: reading(600, 'ppm', { lastReported: old }) }).readings[0].status, 'stale');
+  assert.equal(evaluate({ co2: reading(600, 'ppm', { lastUpdated: old, lastReported: NOW }) }).readings[0].status, 'ok');
+});
+
+test('CO₂ zero is an invalid ambient reading while zero particle readings remain valid', () => {
+  const co2 = evaluate({ co2: reading(0, 'ppm') });
+  assert.equal(co2.readings[0].status, 'invalid');
+  assert.equal(co2.headline, 'Waiting for readings');
+  for (const key of ['pm25', 'pm10', 'pm1', 'pm4']) {
+    const result = evaluate({ [key]: reading(0, 'µg/m³') });
+    assert.equal(result.readings[0].status, 'ok');
+    assert.equal(result.readings[0].value, 0);
+  }
+});
+
+test('explicit future reporting timestamps allow five minutes of clock skew, not unlimited freshness', () => {
+  assert.equal(evaluate({ co2: reading(600, 'ppm', { lastReported: NOW + 5 * 60000 }) }).readings[0].status, 'ok');
+  const future = evaluate({ co2: reading(600, 'ppm', { lastReported: NOW + 5 * 60000 + 1 }) });
+  assert.equal(future.readings[0].status, 'invalid');
+  assert.match(future.readings[0].reason, /future/);
+  assert.equal(evaluate({ co2: reading(600, 'ppm', { lastUpdated: NOW + 86400000 }) }).readings[0].status, 'ok');
+});
+
+test('temperature in Fahrenheit converts to context without an air-quality cutoff', () => {
+  const result = evaluate({ temperature: reading(77, '°F') });
+  assert.equal(result.readings[0].value, 25);
+  assert.equal(result.readings[0].unit, '°C');
+  assert.equal(result.flags.length, 0);
+  for (const [value, unit] of [[-5, '°C'], [23, '°F']]) {
+    const cold = evaluate({ temperature: reading(value, unit) });
+    assert.equal(cold.readings[0].value, -5);
+    assert.equal(cold.readings[0].status, 'ok');
+    assert.equal(cold.flags.length, 0);
+  }
+});
+
+test('PM₁ and PM₄ remain context even at a very high value', () => {
+  const result = evaluate({ pm1: reading(999, 'µg/m³'), pm4: reading(999, 'µg/m³') });
+  assert.equal(result.flags.length, 0);
+  for (const item of result.readings) assert.match(item.basis, /context and trends/);
+});
+
+test('a complete 24-hour window has all 288 aligned five-minute buckets', () => {
+  const result = rollingAverage(buckets(18), { now: NOW });
+  assert.equal(result.average, 18);
+  assert.equal(result.coverage.complete, true);
+  assert.equal(result.coverage.expectedBuckets, 288);
+  assert.equal(result.coverage.end, END);
+  assert.equal(result.coverage.start, END - 86400000);
+  const iso = buckets(18).map(row => ({ ...row, start: new Date(row.start).toISOString(), end: new Date(row.start + BUCKET).toISOString() }));
+  assert.equal(rollingAverage(iso, { now: NOW }).average, 18);
+});
+
+test('a single gap, overlapping bucket or wrong interval prevents a 24-hour claim', () => {
+  for (const change of [rows => rows.splice(22, 1), rows => { rows[22].start += 1000; }, rows => { rows[22].end = rows[22].start + BUCKET * 2; }, rows => { rows[22].mean = NaN; }]) {
+    const rows = buckets(30);
+    change(rows);
+    const result = evaluate({ pm25: reading(30, 'µg/m³') }, { pm25: rows });
+    assert.equal(result.coverage.pm25.complete, false);
+    assert.equal(result.readings[0].average24h, undefined);
+    assert.notEqual(result.categoryKey, 'pm25_24h');
+  }
+});
+
+test('partial or future buckets never fill missing coverage', () => {
+  const rows = buckets(100).slice(1);
+  rows.push({ start: END, mean: 100 });
+  const result = rollingAverage(rows, { now: NOW });
+  assert.equal(result.coverage.availableBuckets, 287);
+  assert.equal(result.average, null);
+});
+
+test('identical duplicates are harmless, conflicting duplicates invalidate their bucket', () => {
+  const rows = buckets(20);
+  assert.equal(rollingAverage([...rows, rows[0]], { now: NOW }).coverage.complete, true);
+  const result = rollingAverage([...rows, { ...rows[0], mean: 200 }], { now: NOW });
+  assert.equal(result.coverage.complete, false);
+  assert.equal(result.coverage.availableBuckets, 287);
+});
+
+test('WHO and Health Canada comparisons use strict greater-than on complete 24-hour means', () => {
+  for (const [key, threshold, unit] of [['pm25', 15, 'µg/m³'], ['pm10', 45, 'µg/m³'], ['co2', 1000, 'ppm']]) {
+    const at = evaluate({ [key]: reading(threshold, unit) }, { [key]: buckets(threshold) });
+    assert.equal(at.categoryKey, `${key}_screening`);
+    const above = evaluate({ [key]: reading(0, unit) }, { [key]: buckets(threshold + 1) });
+    assert.equal(above.categoryKey, `${key}_24h`);
+    assert.equal(above.readings[0].average24h, threshold + 1);
+    assert.match(above.headline, /24-hour average/);
+  }
+});
+
+test('live screening uses inclusive boundaries without claiming an instantaneous agency limit', () => {
+  for (const [key, threshold, unit] of [['pm25', 15, 'µg/m³'], ['pm10', 45, 'µg/m³'], ['co2', 1000, 'ppm']]) {
+    assert.equal(evaluate({ [key]: reading(threshold - 0.01, unit) }).flags.length, 0);
+    const at = evaluate({ [key]: reading(threshold, unit) });
+    assert.equal(at.mood, 'watch');
+    assert.equal(at.flags[0].confirmed, false);
+    assert.match(at.flags[0].basis, /screening/i);
+    assert.doesNotMatch(at.headline, /guideline|danger|unsafe/i);
+  }
+});
+
+test('a customized live screening threshold never changes the agency 24-hour guideline', () => {
+  const result = evaluate({ co2: reading(850, 'ppm') }, { co2: buckets(850) }, { policy: { thresholds: { co2: 800 } } });
+  assert.equal(result.categoryKey, 'co2_screening');
+  assert.doesNotMatch(result.headline, /24-hour/);
+});
+
+test('current plus latest complete mean confirms a trend, never continuous exposure', () => {
+  const result = evaluate({ co2: reading(1100, 'ppm') }, { co2: buckets(1050, 1) });
+  assert.equal(result.flags[0].confirmed, true);
+  assert.equal(result.mood, 'act');
+  assert.match(result.flags[0].reason, /latest complete 5-minute mean/);
+  assert.doesNotMatch(result.flags[0].reason, /continuously|exposure|for 5 minutes/i);
+});
+
+test('an old high bucket or a low latest mean cannot confirm a current event', () => {
+  const old = [{ start: END - 2 * BUCKET, mean: 1300 }];
+  const low = buckets(700, 1);
+  assert.equal(evaluate({ co2: reading(1100, 'ppm') }, { co2: old }).flags[0].confirmed, false);
+  assert.equal(evaluate({ co2: reading(1100, 'ppm') }, { co2: low }).flags[0].confirmed, false);
+});
+
+test('high CO₂ remains the driver when PM₂.₅ is low and advice never suggests a filter fixes CO₂', () => {
+  const result = evaluate({ co2: reading(1400, 'ppm'), pm25: reading(2, 'µg/m³') });
+  assert.equal(result.driver, 'co2');
+  assert.match(result.advice, /fresh-air ventilation/);
+  assert.doesNotMatch(result.advice, /filtration|purifier/);
+});
+
+test('multiple drivers retain both actions and distinguish particle filtration from CO₂ removal', () => {
+  const result = evaluate({ co2: reading(1400, 'ppm'), pm25: reading(30, 'µg/m³') });
+  assert.deepEqual(new Set(result.flags.map(flag => flag.key)), new Set(['co2', 'pm25']));
+  assert.match(result.advice, /particle filtration/);
+  assert.match(result.advice, /filtration does not remove CO₂/);
+});
+
+test('a provisional very strong VOC event cannot suppress confirmed particle evidence or its action', () => {
+  const result = evaluate({ pm25: reading(500, 'µg/m³'), voc: reading(400, '') }, { pm25: buckets(300) });
+  assert.equal(result.driver, 'pm25');
+  assert.equal(result.categoryKey, 'pm25_24h');
+  assert.equal(result.mood, 'act');
+  assert.equal(result.headline, 'Several readings elevated');
+  assert.match(result.advice, /particle filtration/);
+  assert.match(result.advice, /gas sources/);
+  assert.equal(result.flags.find(flag => flag.key === 'voc').confirmed, false);
+});
+
+test('combined particle, CO₂ and NOx advice retains each needed action', () => {
+  const result = evaluate({ pm25: reading(30, 'µg/m³'), co2: reading(1300, 'ppm'), nox: reading(300, '') }, { co2: buckets(1200, 1) });
+  assert.equal(result.driver, 'co2');
+  assert.equal(result.mood, 'act');
+  assert.match(result.advice, /particle filtration/);
+  assert.match(result.advice, /fresh-air ventilation if outdoor conditions permit/);
+  assert.match(result.advice, /combustion/);
+  assert.match(result.advice, /filtration does not remove CO₂/);
+  assert.equal(result.flags.length, 3);
+});
+
+test('manufacturer gas bands are relative event strengths, with their own NOx baseline', () => {
+  for (const [key, bands] of Object.entries(DEFAULT_POLICY.gasBands)) {
+    assert.equal(evaluate({ [key]: reading(bands[0] - 0.1, '') }).flags.length, 0);
+    for (let i = 0; i < bands.length; i++) {
+      const result = evaluate({ [key]: reading(bands[i], '') });
+      assert.equal(result.severity, i + 1);
+      assert.equal(result.flags[0].confirmed, false);
+      assert.match(result.flags[0].basis, /relative gas events/);
+      assert.doesNotMatch(result.headline, /safe|hazard|NO₂|ppb|µg/i);
+    }
+  }
+  const nox = evaluate({ nox: reading(20, '') }, { nox: buckets(20, 1) });
+  assert.equal(nox.flags[0].confirmed, true);
+  assert.equal(evaluate({ nox: reading(1, '') }).flags.length, 0);
+});
+
+test('humidity at 30% and 50% is unflagged; outside is provisional without complete history', () => {
+  for (const value of [30, 50]) assert.equal(evaluate({ humidity: reading(value, '%') }).flags.length, 0);
+  for (const value of [29.9, 50.1]) assert.equal(evaluate({ humidity: reading(value, '%') }).flags[0].confirmed, false);
+});
+
+test('humidity trend requires six valid outside-range means, not just an outside-range average', () => {
+  const high = evaluate({ humidity: reading(60, '%') }, { humidity: buckets(60, 6) });
+  assert.equal(high.flags[0].confirmed, true);
+  const mixed = buckets(60, 6);
+  mixed[2].mean = 45;
+  assert.equal(evaluate({ humidity: reading(60, '%') }, { humidity: mixed }).flags[0].confirmed, false);
+  assert.equal(evaluate({ humidity: reading(60, '%') }, { humidity: buckets(60, 5) }).flags[0].confirmed, false);
+});
+
+test('a known issue survives unavailable expected readings; all missing and partial data stay explicit', () => {
+  const known = evaluate({ co2: reading(1300, 'ppm'), pm25: reading(null, 'µg/m³', { available: false }) });
+  assert.equal(known.driver, 'co2');
+  assert.equal(known.partial, true);
+  assert.match(known.headline, /partial data/);
+  assert.equal(evaluate({ co2: reading(600, 'ppm'), pm25: reading(null, 'µg/m³') }).headline, 'Limited sensor data');
+  assert.equal(evaluate({}).headline, 'Waiting for readings');
+});
+
+test('complete PM/CO₂ history stays actionable when its current reading is unavailable, invalid or stale', () => {
+  for (const [key, mean, unit] of [['pm25', 30, 'µg/m³'], ['pm10', 60, 'µg/m³'], ['co2', 1300, 'ppm']]) {
+    for (const current of [reading(null, unit, { available: false }), reading('', unit), reading(mean, unit, { lastReported: NOW - 86400000 })]) {
+      const result = evaluate({ [key]: current }, { [key]: buckets(mean) });
+      assert.equal(result.driver, key);
+      assert.equal(result.categoryKey, `${key}_24h`);
+      assert.equal(result.partial, true);
+      assert.match(result.headline, /24-hour average elevated · partial data/);
+      assert.equal(result.mood, 'act');
+      assert.equal(result.readings[0].average24h, mean);
+      assert.ok(['invalid', 'stale'].includes(result.readings[0].status));
+    }
+  }
+  const mixed = evaluate({ pm25: reading(null, 'µg/m³', { available: false }), co2: reading(600, 'ppm') }, { pm25: buckets(30) });
+  assert.equal(mixed.driver, 'pm25');
+  assert.match(mixed.headline, /partial data/);
+});
+
+test('historical means with an incompatible current sensor unit cannot support agency comparisons', () => {
+  const result = evaluate({ pm25: reading(null, 'ppm', { available: false }) }, { pm25: buckets(30) });
+  assert.equal(result.flags.length, 0);
+  assert.equal(result.readings[0].average24h, undefined);
+});

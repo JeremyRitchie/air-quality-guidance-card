@@ -1,0 +1,1334 @@
+import { evaluateGuidance, normalizeReading, DEFAULT_POLICY } from "./guidance.js";
+
+/**
+ * Air Quality Guidance Card
+ *
+ * A standalone Lovelace card for ANY air-quality sensor in Home Assistant
+ * (IKEA ALPSTUGA, AirGradient, Awair, PurpleAir, ESPHome builds, …).
+ * Point it at a PM2.5 or CO₂ sensor and it renders an animated scene with a
+ * mascot whose mood follows the reading, plus a tap-to-expand detail view
+ * with a 24 h chart, 12/24 h averages and a 10-day-by-hour heatmap built
+ * from Home Assistant's own recorder statistics.
+ *
+ * Five headline metrics are supported (config `metric`, auto-detected from the
+ * entity's device_class — or entity_id, for the unitless indices — when
+ * omitted):
+ *   - pm25: retained EPA-coloured historical context; headline guidance uses
+ *     separate sourced screening and complete 24-hour comparisons.
+ *   - co2: retained historical context, with sourced 24-hour guidance and
+ *     explicitly provisional current-reading screening.
+ *   - pm10: US EPA PM10 AQI breakpoints (24-hour).
+ *   - voc: Sensirion VOC Index (100 = recent running-average baseline).
+ *   - nox: Sensirion NOx Index (1 = clean-air baseline, spikes on events).
+ * All metrics retain raw history; relative gas indices are not concentrations.
+ *
+ * Secondary readings (temperature, humidity, and every sibling pollutant —
+ * CO₂, PM1/2.5/10, PM0.3 count, VOC, NOx) are auto-discovered from entities on
+ * the same device and shown as chips, or can be set explicitly. The `chips`
+ * option chooses between "auto" (all discovered readings) and "minimal"
+ * (temperature, humidity and one complementary pollutant), or an explicit list.
+ */
+
+const PM25_CATEGORIES = [
+  { max: 9.0, key: "good", label: "Good", color: "#43a047", sky: ["#dcf3dd", "#f2faf0"], ground: "#66bb6a", mood: "happy" },
+  { max: 35.4, key: "moderate", label: "Moderate", color: "#fbc02d", sky: ["#fdf3d5", "#fbfaf2"], ground: "#c9b458", mood: "ok" },
+  { max: 55.4, key: "usg", label: "Unhealthy for Sensitive Groups", color: "#ef6c00", sky: ["#fde5cc", "#fdf6ef"], ground: "#e09a52", mood: "meh" },
+  { max: 125.4, key: "unhealthy", label: "Unhealthy", color: "#e53935", sky: ["#fbdad8", "#fdf1f0"], ground: "#d96a63", mood: "sad" },
+  { max: 225.4, key: "very_unhealthy", label: "Very Unhealthy", color: "#8e24aa", sky: ["#ecd9f2", "#f8f1fa"], ground: "#a35cb5", mood: "sad" },
+  { max: Infinity, key: "hazardous", label: "Hazardous", color: "#7f0f3e", sky: ["#f0d3de", "#faf0f4"], ground: "#9c4a6b", mood: "sad" },
+];
+
+const CO2_CATEGORIES = [
+  { max: 800, key: "good", label: "Fresh", color: "#43a047", sky: ["#dcf3dd", "#f2faf0"], ground: "#66bb6a", mood: "happy" },
+  { max: 1000, key: "moderate", label: "Acceptable", color: "#fbc02d", sky: ["#fdf3d5", "#fbfaf2"], ground: "#c9b458", mood: "ok" },
+  { max: 1500, key: "usg", label: "Getting Stuffy", color: "#ef6c00", sky: ["#fde5cc", "#fdf6ef"], ground: "#e09a52", mood: "meh" },
+  { max: 2000, key: "unhealthy", label: "Stuffy — Ventilate", color: "#e53935", sky: ["#fbdad8", "#fdf1f0"], ground: "#d96a63", mood: "sad" },
+  { max: 5000, key: "very_unhealthy", label: "Poor", color: "#8e24aa", sky: ["#ecd9f2", "#f8f1fa"], ground: "#a35cb5", mood: "sad" },
+  { max: Infinity, key: "hazardous", label: "Extreme", color: "#7f0f3e", sky: ["#f0d3de", "#faf0f4"], ground: "#9c4a6b", mood: "sad" },
+];
+
+// US EPA PM10 AQI breakpoints (24-hour average, µg/m³).
+const PM10_CATEGORIES = [
+  { max: 54, key: "good", label: "Good", color: "#43a047", sky: ["#dcf3dd", "#f2faf0"], ground: "#66bb6a", mood: "happy" },
+  { max: 154, key: "moderate", label: "Moderate", color: "#fbc02d", sky: ["#fdf3d5", "#fbfaf2"], ground: "#c9b458", mood: "ok" },
+  { max: 254, key: "usg", label: "Unhealthy for Sensitive Groups", color: "#ef6c00", sky: ["#fde5cc", "#fdf6ef"], ground: "#e09a52", mood: "meh" },
+  { max: 354, key: "unhealthy", label: "Unhealthy", color: "#e53935", sky: ["#fbdad8", "#fdf1f0"], ground: "#d96a63", mood: "sad" },
+  { max: 424, key: "very_unhealthy", label: "Very Unhealthy", color: "#8e24aa", sky: ["#ecd9f2", "#f8f1fa"], ground: "#a35cb5", mood: "sad" },
+  { max: Infinity, key: "hazardous", label: "Hazardous", color: "#7f0f3e", sky: ["#f0d3de", "#faf0f4"], ground: "#9c4a6b", mood: "sad" },
+];
+
+// Sensirion VOC Index (1–500). 100 is the sensor's own recent running-average
+// baseline; higher means more VOCs than usual for this room.
+const VOC_CATEGORIES = [
+  { max: 100, key: "good", label: "Clean", color: "#43a047", sky: ["#dcf3dd", "#f2faf0"], ground: "#66bb6a", mood: "happy" },
+  { max: 200, key: "moderate", label: "Normal", color: "#fbc02d", sky: ["#fdf3d5", "#fbfaf2"], ground: "#c9b458", mood: "ok" },
+  { max: 300, key: "usg", label: "Elevated", color: "#ef6c00", sky: ["#fde5cc", "#fdf6ef"], ground: "#e09a52", mood: "meh" },
+  { max: 400, key: "unhealthy", label: "High", color: "#e53935", sky: ["#fbdad8", "#fdf1f0"], ground: "#d96a63", mood: "sad" },
+  { max: Infinity, key: "very_unhealthy", label: "Very High", color: "#8e24aa", sky: ["#ecd9f2", "#f8f1fa"], ground: "#a35cb5", mood: "sad" },
+];
+
+// Sensirion NOx Index (1–500). Sits at 1 in clean air and only rises during
+// nitrogen-oxide events (cooking, combustion, traffic).
+const NOX_CATEGORIES = [
+  { max: 20, key: "good", label: "Baseline", color: "#43a047", sky: ["#dcf3dd", "#f2faf0"], ground: "#66bb6a", mood: "happy" },
+  { max: 150, key: "moderate", label: "Moderate", color: "#fbc02d", sky: ["#fdf3d5", "#fbfaf2"], ground: "#c9b458", mood: "ok" },
+  { max: 300, key: "usg", label: "Elevated", color: "#ef6c00", sky: ["#fde5cc", "#fdf6ef"], ground: "#e09a52", mood: "meh" },
+  { max: Infinity, key: "unhealthy", label: "High", color: "#e53935", sky: ["#fbdad8", "#fdf1f0"], ground: "#d96a63", mood: "sad" },
+];
+
+
+const METRICS = {
+  pm25: {
+    key: "pm25",
+    labelHtml: "PM<sub>2.5</sub>",
+    short: "PM2.5",
+    unit: "µg/m³",
+    decimals: 1,
+    deviceClass: "pm25",
+    chartFloor: 5,
+    categories: PM25_CATEGORIES,
+    nameSuffix: /\s*PM\s*2\.?5$/i,
+    attribution:
+      "Historical PM2.5 colour bands use EPA concentration breakpoints for visual context only. Recorded sample charts are not an official AQI or proof of continuous exposure.",
+  },
+  co2: {
+    key: "co2",
+    labelHtml: "CO<sub>2</sub>",
+    short: "CO₂",
+    unit: "ppm",
+    decimals: 0,
+    deviceClass: "carbon_dioxide",
+    chartFloor: 1000,
+    categories: CO2_CATEGORIES,
+    nameSuffix: /\s*(carbon dioxide|CO₂|CO2)$/i,
+    attribution:
+      "Historical CO₂ colour bands are visual context only. Current readings are screening information; guideline comparisons require the stated complete averaging period.",
+  },
+  pm10: {
+    key: "pm10",
+    labelHtml: "PM<sub>10</sub>",
+    short: "PM10",
+    unit: "µg/m³",
+    decimals: 0,
+    deviceClass: "pm10",
+    chartFloor: 55,
+    categories: PM10_CATEGORIES,
+    nameSuffix: /\s*PM\s*10$/i,
+    attribution:
+      "Historical PM10 colour bands use EPA concentration breakpoints for visual context only. Recorded sample charts are not an official AQI or proof of continuous exposure.",
+  },
+  voc: {
+    key: "voc",
+    labelHtml: "VOC index",
+    short: "VOC index",
+    unit: "",
+    decimals: 0,
+    deviceClass: null,
+    idRe: /_[tv]?voc(_index)?$/i,
+    chartFloor: 200,
+    categories: VOC_CATEGORIES,
+    nameSuffix: /\s*[TV]?VOCs?(\s*index)?$/i,
+    attribution:
+      "Sensirion VOC Index: 100 is the sensor's recent running-average baseline; higher means more volatile organic compounds than usual for this room. History recorded by Home Assistant's long-term statistics.",
+  },
+  nox: {
+    key: "nox",
+    labelHtml: "NOx index",
+    short: "NOx index",
+    unit: "",
+    decimals: 0,
+    deviceClass: null,
+    idRe: /_nox(_index)?$/i,
+    chartFloor: 30,
+    categories: NOX_CATEGORIES,
+    nameSuffix: /\s*NOx(\s*index)?$/i,
+    attribution:
+      "Sensirion NOx Index: 1 is the clean-air baseline; it rises during nitrogen-oxide events such as cooking or combustion. History recorded by Home Assistant's long-term statistics.",
+  },
+};
+
+// Every secondary reading the card can discover on the same device and show as
+// a chip. `dc` is the Home Assistant device_class when the platform sets one;
+// `idRe` matches the entity_id for readings that carry none (VOC/NOx indices
+// and the PM0.3 particle count). Explicit config overrides win over discovery.
+// Each reading gets a distinct icon so the chips are legible at a glance even
+// when several are shown together (three PM sizes, two Sensirion indices).
+const READINGS = {
+  temperature: { dc: "temperature", icon: "mdi:thermometer", unit: "°", digits: 0 },
+  humidity: { dc: "humidity", icon: "mdi:water-percent", unit: "%", digits: 0 },
+  co2: { dc: "carbon_dioxide", icon: "mdi:molecule-co2", unit: "", digits: 0 },
+  pm25: { dc: "pm25", icon: "mdi:blur", unit: "", digits: 1 },
+  pm4: { dc: "pm4", icon: "mdi:blur-linear", unit: "", digits: 1 },
+  pm1: { dc: "pm1", icon: "mdi:blur-radial", unit: "", digits: 0 },
+  pm10: { dc: "pm10", icon: "mdi:dots-grid", unit: "", digits: 0 },
+  pm03: { icon: "mdi:grain", unit: "", digits: 0, idRe: /_pm_?0_?3$/i },
+  voc: { icon: "mdi:scent", unit: "", digits: 0, idRe: /_[tv]?voc(_index)?$/i },
+  nox: { icon: "mdi:smog", unit: "", digits: 0, idRe: /_nox(_index)?$/i },
+};
+
+// Order chips appear in when `chips: auto`.
+const CHIP_ORDER = ["temperature", "humidity", "co2", "pm25", "pm1", "pm4", "pm10", "pm03", "voc", "nox"];
+
+// Friendly labels for the editor's reading pickers / tick list.
+const READING_LABELS = {
+  temperature: "Temperature",
+  humidity: "Humidity",
+  co2: "CO₂",
+  pm25: "PM2.5",
+  pm1: "PM1",
+  pm4: "PM4",
+  pm10: "PM10",
+  pm03: "PM0.3",
+  voc: "VOC index",
+  nox: "NOx index",
+};
+
+const CARD_VERSION = "2.0.0";
+
+const fmt = (v, digits = 1) =>
+  v == null || Number.isNaN(v) ? "–" : Number(v).toFixed(digits).replace(/\.0$/, "");
+
+/** Escape a value for interpolation into markup. Entity friendly_name and the
+ *  card's own `name` option are freeform user text, so anything that reaches an
+ *  innerHTML template — text node or attribute value — has to go through here. */
+const esc = (s) =>
+  String(s ?? "").replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+
+/** Finite scalar parsing shared by current-value display and chips. */
+const cardFiniteReading = raw => {
+  if (raw == null || typeof raw === "boolean" ||
+      (typeof raw === "string" && raw.trim() === "")) return null;
+  const number = Number(raw);
+  return Number.isFinite(number) ? number : null;
+};
+
+const cardGuidanceVisual = guidance => {
+  if (guidance.mood === "waiting" || (guidance.partial && !guidance.flags?.length)) return { key: "offline", label: guidance.headline,
+    color: "#8b8379", sky: ["#e0e0e0", "#f5f5f5"], ground: "#746b5d", mood: "ok" };
+  const level = Math.max(0, Math.min(3, Number(guidance.severity) || 0));
+  const base = PM25_CATEGORIES[level];
+  return { ...base, mood: { calm: "happy", watch: "meh", act: "sad" }[guidance.mood] ?? base.mood };
+};
+
+const cardSafeLink = raw => {
+  try { const url = new URL(raw); return ["https:", "http:"].includes(url.protocol) ? esc(url.href) : ""; }
+  catch { return ""; }
+};
+
+export class AirQualityGuidanceCard extends HTMLElement {
+  static getStubConfig(hass) {
+    const entity = Object.keys(hass?.states ?? {}).find((id) =>
+      ["pm25", "carbon_dioxide"].includes(hass.states[id]?.attributes?.device_class)
+    );
+    // Generic name so the picker preview doesn't display whichever real
+    // sensor the stub happened to grab. Cleared or replaced in the editor.
+    return { entity: entity ?? "sensor.pm2_5", name: "Air Quality" };
+  }
+
+  static async getConfigElement() {
+    return document.createElement("air-quality-guidance-card-editor");
+  }
+
+  setConfig(config) {
+    if (!config?.entity) {
+      throw new Error("air-quality-guidance-card: 'entity' (a PM2.5 or CO₂ sensor) is required");
+    }
+    if (config.metric && !METRICS[config.metric]) {
+      throw new Error(
+        "air-quality-guidance-card: 'metric' must be one of: " + Object.keys(METRICS).join(", ")
+      );
+    }
+    if (
+      config.chips != null &&
+      config.chips !== "auto" &&
+      config.chips !== "minimal" &&
+      !Array.isArray(config.chips)
+    ) {
+      throw new Error(
+        "air-quality-guidance-card: 'chips' must be 'auto', 'minimal', or a list of reading keys"
+      );
+    }
+    if (config.guidance && !["all_available", "primary"].includes(config.guidance)) {
+      throw new Error("air-quality-guidance-card: guidance must be all_available or primary");
+    }
+    if (this.shadowRoot) this._closeOverlay();
+    this._generation = (this._generation ?? 0) + 1;
+    this._config = { guidance: "all_available", ...config };
+    this._related = null;
+    this._relatedFor = null;
+    this._fingerprint = null;
+    this._stats = null;
+    this._secStats = null;
+    this._guidanceSamples = {};
+    this._guidanceStatsAt = 0;
+    this._guidanceStatsPromise = null;
+    this._statsCacheAt = 0;
+    if (this.shadowRoot) this.shadowRoot.innerHTML = "";
+    this._built = false;
+  }
+
+  /** The active metric: explicit config, else inferred from the entity, else pm25. */
+  _metric() {
+    if (this._config.metric) return METRICS[this._config.metric];
+    return this._metricForEntity(this._config.entity);
+  }
+
+  /** Infer a headline metric from an entity's device_class, or entity_id for
+   * the unitless indices (which carry no device_class). Falls back to pm25. */
+  _metricForEntity(entityId) {
+    const dc = this._hass?.states[entityId]?.attributes?.device_class;
+    const byDc = { carbon_dioxide: "co2", pm25: "pm25", pm10: "pm10" }[dc];
+    if (byDc) return METRICS[byDc];
+    for (const key of ["voc", "nox"]) {
+      if (METRICS[key].idRe?.test(entityId)) return METRICS[key];
+    }
+    return METRICS.pm25;
+  }
+
+  _categoryFor(value) {
+    return this._catForMetric(this._metric(), value);
+  }
+
+  _catForMetric(metric, value) {
+    const cats = metric.categories;
+    return cats.find((c) => value <= c.max) ?? cats[cats.length - 1];
+  }
+
+  /** A metric-like descriptor for any reading, used to draw its 24 h chart in
+   *  the expanded view. The five headline readings reuse their full category
+   *  scale; the rest get a sensible unit/precision and a single neutral colour
+   *  (PM1 and PM4 deliberately have no borrowed health-category scale). */
+  _readingMetric(key) {
+    const headline = { co2: "co2", pm25: "pm25", pm10: "pm10", voc: "voc", nox: "nox" }[key];
+    if (headline) return METRICS[headline];
+    const st = this._related?.[key] && this._hass.states[this._related[key]];
+    const unit = esc(st?.attributes?.unit_of_measurement ?? READINGS[key]?.unit ?? "");
+    const base = {
+      pm1: { labelHtml: "PM<sub>1</sub>", short: "PM1", decimals: 1, chartFloor: 5, color: "#607d8b" },
+      pm4: { labelHtml: "PM<sub>4</sub>", short: "PM4", decimals: 1, chartFloor: 5, color: "#607d8b" },
+      pm03: { labelHtml: "PM<sub>0.3</sub>", short: "PM0.3", decimals: 0, chartFloor: 0, color: "#5c6bc0" },
+      temperature: { labelHtml: "Temperature", short: "Temperature", decimals: 1, chartFloor: 0, color: "#ff8f00" },
+      humidity: { labelHtml: "Humidity", short: "Humidity", decimals: 0, chartFloor: 100, color: "#29b6f6" },
+    }[key] ?? { labelHtml: key, short: key, decimals: 0, chartFloor: 0, color: "#607d8b" };
+    return {
+      ...base,
+      unit,
+      categories:
+        base.categories ??
+        [{ max: Infinity, label: base.short, color: base.color, mood: "ok", sky: ["#fff", "#fff"], ground: base.color }],
+    };
+  }
+
+  /** Which secondary readings to show as chips, honouring the `chips` option.
+   *  auto (default): every discovered reading except the headline one.
+   *  minimal: temperature, humidity and one complementary pollutant.
+   *  array: exactly the listed reading keys, in that order. */
+  _chipKeys(metric) {
+    const chips = this._config.chips ?? "auto";
+    if (Array.isArray(chips)) return chips.filter((k) => k !== metric.key);
+    if (chips === "minimal") {
+      return ["temperature", "humidity", metric === METRICS.co2 ? "pm25" : "co2"];
+    }
+    return CHIP_ORDER.filter((k) => k !== metric.key);
+  }
+
+  set hass(hass) {
+    if (this._connection && this._connection !== hass.connection) {
+      this._guidanceStatsAt = 0;
+      this._guidanceSamples = {};
+      this._generation = (this._generation ?? 0) + 1;
+      this._guidanceStatsPromise = null;
+    }
+    if (this._entityRegistry !== hass.entities) this._related = null;
+    this._entityRegistry = hass.entities;
+    this._connection = hass.connection;
+    this._hass = hass;
+    if (!this._built) this._build();
+    this._relatedIds();
+    const signature = Object.values(this._related).map(id => {
+      const st = hass.states[id];
+      return [id, st?.state, st?.last_reported, st?.last_updated,
+        st?.attributes?.unit_of_measurement].join("|");
+    }).join(";");
+    if (signature !== this._fingerprint) {
+      this._fingerprint = signature;
+      this._update();
+    }
+    this._refreshGuidanceStats();
+  }
+
+  connectedCallback() {
+    clearInterval(this._refreshTimer);
+    this._onVisibility = () => {
+      if (this._isVisible()) {
+        if (this._built && this._hass) this._update();
+        this._refreshGuidanceStats();
+      }
+    };
+    document.addEventListener("visibilitychange", this._onVisibility);
+    if (typeof IntersectionObserver !== "undefined") {
+      this._intersecting = false;
+      this._intersectionObserver = new IntersectionObserver(entries => {
+        this._intersecting = entries.some(e => e.isIntersecting);
+        this._onVisibility();
+      });
+      this._intersectionObserver.observe(this);
+    }
+    this._refreshTimer = setInterval(this._onVisibility, 60_000);
+    this._onVisibility();
+  }
+
+  disconnectedCallback() {
+    clearInterval(this._refreshTimer);
+    document.removeEventListener("visibilitychange", this._onVisibility);
+    this._intersectionObserver?.disconnect();
+    this._generation = (this._generation ?? 0) + 1;
+    this._guidanceStatsPromise = null;
+    this._closeOverlay();
+  }
+
+  _isVisible() {
+    return this.isConnected && document.visibilityState !== "hidden" &&
+      (!this._intersectionObserver || this._intersecting);
+  }
+
+  _guidanceReadings() {
+    this._relatedIds();
+    const ids = { ...this._related, [this._metric().key]: this._config.entity };
+    const readings = {};
+    for (const key of Object.keys(READINGS)) {
+      if (key === "pm03") continue; // A particle count is context, not a guidance input.
+      const id = ids[key];
+      if (!id) continue;
+      const st = this._hass.states[id];
+      readings[key] = {
+        value: st?.state,
+        unit: st?.attributes?.unit_of_measurement,
+        available: !!st && !["unknown", "unavailable"].includes(st.state),
+        lastReported: st?.last_reported,
+        lastUpdated: st?.last_updated,
+        entityId: id,
+      };
+    }
+    return readings;
+  }
+
+  _displayReading(key, state) {
+    if (key === "pm03") {
+      const value = cardFiniteReading(state?.state);
+      return value != null && value >= 0 ? value : null;
+    }
+    const reading = normalizeReading(key, { value: state?.state,
+      unit: state?.attributes?.unit_of_measurement,
+      available: !!state && !["unknown", "unavailable"].includes(state.state),
+      lastReported: state?.last_reported, lastUpdated: state?.last_updated },
+      { now: Date.now(), policy: this._config.guidance_policy });
+    return ["invalid", "stale"].includes(reading.status) ? null : reading.value;
+  }
+
+  _evaluateGuidance() {
+    return evaluateGuidance({ now: Date.now(), readings: this._guidanceReadings(),
+      samples: this._guidanceSamples ?? {}, policy: this._config.guidance_policy });
+  }
+
+  _historyUnitCompatible(key) {
+    this._relatedIds();
+    const id = key === this._metric().key ? this._config.entity : this._related?.[key];
+    const state = id && this._hass.states[id];
+    if (!state) return false;
+    // Unit validation is independent of current availability/freshness: recorded
+    // history remains useful when a compatible sensor temporarily goes offline.
+    if (key === "pm03") return true; // Context-only count, labelled with its raw source unit.
+    return normalizeReading(key, { value: 1,
+      unit: state.attributes?.unit_of_measurement, available: true }).status !== "invalid";
+  }
+
+  async _refreshGuidanceStats() {
+    if (!this._config || !this._hass || !this._isVisible() ||
+        this._config.guidance === "primary" || this._guidanceStatsPromise ||
+        Date.now() - (this._guidanceStatsAt ?? 0) < 300_000) return;
+    const readings = this._guidanceReadings();
+    const keys = ["pm25", "pm10", "co2", "humidity", "voc", "nox"]
+      .filter(key => readings[key]?.entityId);
+    if (!keys.length) return;
+    const ids = [...new Set(keys.map(key => readings[key].entityId))];
+    const end = Math.floor(Date.now() / 300_000) * 300_000;
+    const generation = this._generation;
+    const request = Promise.resolve().then(() => this._hass.callWS({ type: "recorder/statistics_during_period",
+      start_time: new Date(end - 86_400_000).toISOString(),
+      end_time: new Date(end).toISOString(), statistic_ids: ids,
+      period: "5minute", types: ["mean", "max"] }));
+    this._guidanceStatsPromise = request;
+    try {
+      const result = await request;
+      if (generation !== this._generation) return;
+      this._guidanceSamples = Object.fromEntries(keys.map(key => [key,
+        Array.isArray(result?.[readings[key].entityId]) ? result[readings[key].entityId] : []]));
+      this._guidanceStatsError = false;
+    } catch {
+      if (generation !== this._generation) return;
+      this._guidanceSamples = {};
+      this._guidanceStatsError = true;
+    } finally {
+      if (generation === this._generation) {
+        this._guidanceStatsAt = Date.now();
+        if (this._built && this._hass) this._update();
+      }
+      if (this._guidanceStatsPromise === request) this._guidanceStatsPromise = null;
+    }
+  }
+
+  _guidanceDetails(guidance) {
+    const entries = Array.isArray(guidance.readings) ? guidance.readings.map(item => [item.key, item]) : Object.entries(guidance.readings ?? {});
+    const flags = guidance.flags ?? [];
+    const references = new Map();
+    for (const item of [...Object.values(DEFAULT_POLICY.sources ?? {}), ...flags,
+        ...entries.map(([, value]) => value)]) {
+      const url = typeof item === "string" ? item : item?.referenceUrl ?? item?.url;
+      const link = cardSafeLink(url);
+      if (link) references.set(link, typeof item === "string" ? url :
+        item.reference ?? item.label ?? item.name ?? url);
+    }
+    const driver = guidance.driver ? READING_LABELS[guidance.driver] ?? guidance.driver : null;
+    const list = entries.map(([key, item]) => {
+      const status = item.status ?? "unavailable";
+      const current = !["invalid", "stale"].includes(status) ? cardFiniteReading(item.value) : null;
+      const unit = item.unit ? ` ${item.unit}` : "";
+      const coverage = guidance.coverage?.[key];
+      const count = coverage?.availableBuckets;
+      const expected = coverage?.expectedBuckets;
+      return `<li><strong>${esc(READING_LABELS[key] ?? key)}</strong> · ${esc(status)}
+        <span>Current: ${current == null ? "–" : esc(fmt(current, 1) + unit)}</span>
+        <span>${esc(item.reason ?? item.basis ?? "")}</span>
+        ${item.average24h != null ? `<span>24 h mean: ${esc(fmt(item.average24h, 1) + unit)}</span>` : ""}
+        ${count != null ? `<span>Recorded 5-minute means: ${esc(count)} / ${esc(expected)}</span>` : ""}</li>`;
+    }).join("");
+    return `<section class="guidance-details" aria-label="Guidance from available readings">
+      <h2>${esc(guidance.headline)}</h2><p>${esc(guidance.advice)}</p>
+      <p class="guidance-basis">${driver ? `Driven by ${esc(driver)}. ` : ""}
+        ${guidance.partial ? "Some readings or averaging periods are incomplete. " : ""}
+        Sensor guidance, not a composite AQI or an assurance that the room is safe.</p>
+      ${this._guidanceStatsError ? '<p>Recorded averages unavailable; current readings are screening information only.</p>' : ""}
+      <ul class="guidance-readings">${list}</ul>
+      ${flags.length ? `<ul class="guidance-flags">${flags.map(flag => `<li><strong>${esc(flag.headline ?? READING_LABELS[flag.key] ?? flag.key)}</strong>: ${esc(flag.basis ?? flag.advice ?? "")}</li>`).join("")}</ul>` : ""}
+      <details class="guidance-references"><summary>Guidelines and interpretation</summary>
+        <p>24-hour comparisons require 288 complete recorded 5-minute means. Sample means are not proof of continuous exposure. Current values are clearly labelled screening values. VOC/NOx indices are relative gas indicators, not concentrations or health limits. PM1 and PM4 are context, without borrowed PM2.5 health categories. Any PM0.3 particle count is also context only.</p>
+        <ul>${[...references].map(([url, label]) => `<li><a href="${url}" target="_blank" rel="noopener noreferrer">${esc(label)}</a></li>`).join("")}</ul>
+      </details></section>`;
+  }
+
+  getCardSize() {
+    return 4;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Entity discovery: find sibling sensors on the same device           */
+  /* ------------------------------------------------------------------ */
+
+  _relatedIds(state) {
+    if (this._related && this._relatedFor === this._config.entity) {
+      return Object.values(this._related).filter(Boolean);
+    }
+    const hass = this._hass;
+    const related = { primary: this._config.entity };
+    const reg = hass.entities?.[this._config.entity];
+    if (reg?.device_id && hass.entities) {
+      const siblings = Object.values(hass.entities).filter(
+        (e) => e.device_id === reg.device_id
+      );
+      for (const sib of siblings) {
+        if (sib.entity_id === this._config.entity) continue;
+        const st = hass.states[sib.entity_id];
+        if (!st) continue;
+        const dc = st.attributes?.device_class;
+        for (const [key, r] of Object.entries(READINGS)) {
+          if (related[key]) continue;
+          if ((r.dc && dc === r.dc) || (r.idRe && r.idRe.test(sib.entity_id))) {
+            related[key] = sib.entity_id;
+            break;
+          }
+        }
+      }
+    }
+    // Explicit overrides from config always win over discovery.
+    for (const key of Object.keys(READINGS)) {
+      if (this._config[key]) related[key] = this._config[key];
+    }
+    this._related = related;
+    this._relatedFor = this._config.entity;
+    return Object.values(related).filter(Boolean);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* DOM                                                                  */
+  /* ------------------------------------------------------------------ */
+
+  _build() {
+    this._built = true;
+    const root = this.shadowRoot ?? this.attachShadow({ mode: "open" });
+    root.innerHTML = `
+      <style>${AirQualityGuidanceCard.styles}</style>
+      <ha-card>
+        <div class="scene" role="button" tabindex="0" aria-label="Show air quality details">
+          <div class="sky"></div>
+          <div class="clouds">
+            <div class="cloud c1"></div><div class="cloud c2"></div><div class="cloud c3"></div>
+          </div>
+          <svg class="hills" viewBox="0 0 400 90" preserveAspectRatio="none" aria-hidden="true">
+            <path class="hill hill-back" d="M0,58 C60,30 130,44 200,50 C280,56 330,34 400,48 L400,90 L0,90 Z"></path>
+            <path class="hill hill-front" d="M0,74 C80,56 150,70 230,66 C310,62 350,72 400,64 L400,90 L0,90 Z"></path>
+            <g class="trees"></g>
+          </svg>
+          <div class="head">
+            <div class="titles">
+              <div class="name"></div>
+              <div class="category"></div>
+              <div class="guidance"></div>
+            </div>
+            <div class="mascot-badge"><svg class="mascot" viewBox="0 0 80 80"></svg></div>
+          </div>
+          <div class="strip">
+            <div class="pm"><span class="pm-label"></span> <b class="pm-value"></b> <span class="pm-unit"></span></div>
+            <div class="chips"></div>
+          </div>
+        </div>
+      </ha-card>
+      <div class="overlay" hidden></div>
+      <div class="tooltip" hidden></div>
+    `;
+    const scene = root.querySelector(".scene");
+    scene.addEventListener("click", () => this._openOverlay());
+    scene.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        this._openOverlay();
+      }
+    });
+    const trees = root.querySelector(".trees");
+    const treeXs = [26, 52, 196, 318, 352];
+    trees.innerHTML = treeXs
+      .map(
+        (x, i) => `
+        <g class="tree t${i}" transform="translate(${x},${62 + (i % 2) * 8})">
+          <rect x="-1.6" y="0" width="3.2" height="9" rx="1" class="trunk"></rect>
+          <path d="M0,-16 L8,2 L-8,2 Z" class="leaves"></path>
+          <path d="M0,-9 L9.5,6 L-9.5,6 Z" class="leaves"></path>
+        </g>`
+      )
+      .join("");
+  }
+
+  _mascotSvg(mood) {
+    const face = {
+      happy: `<path d="M30 47 Q40 56 50 47" class="mouth"/><circle cx="31" cy="38" r="3.2" class="eye"/><circle cx="49" cy="38" r="3.2" class="eye"/>`,
+      ok: `<path d="M31 49 L49 49" class="mouth"/><circle cx="31" cy="38" r="3.2" class="eye"/><circle cx="49" cy="38" r="3.2" class="eye"/>`,
+      meh: `<path d="M31 51 Q40 46 49 51" class="mouth"/><circle cx="31" cy="38" r="3.2" class="eye"/><circle cx="49" cy="38" r="3.2" class="eye"/>`,
+      sad: `<path d="M30 52 Q40 44 50 52" class="mouth"/><path d="M26 36 L36 39" class="brow"/><path d="M54 36 L44 39" class="brow"/><circle cx="31" cy="41" r="3" class="eye"/><circle cx="49" cy="41" r="3" class="eye"/>`,
+    }[mood];
+    return `
+      <path d="M22 12 h36 a8 8 0 0 1 8 8 v34 a14 14 0 0 1 -14 14 h-24 a14 14 0 0 1 -14 -14 v-34 a8 8 0 0 1 8 -8 Z" class="body"/>
+      <path d="M22 12 h36 a8 8 0 0 1 8 8 v6 h-52 v-6 a8 8 0 0 1 8 -8 Z" class="cap"/>
+      <circle cx="25" cy="47" r="2.6" class="blush"/><circle cx="55" cy="47" r="2.6" class="blush"/>
+      ${face}`;
+  }
+
+  _update() {
+    const root = this.shadowRoot;
+    if (!root || !this._hass) return;
+    const hass = this._hass;
+    const state = hass.states[this._config.entity];
+    const scene = root.querySelector(".scene");
+    const metric = this._metric();
+    this._relatedIds();
+    const value = this._displayReading(metric.key, state);
+    const guidance = this._evaluateGuidance();
+    this._guidance = guidance;
+    const primary = this._config.guidance === "primary";
+    const cat = primary ? value != null ? this._categoryFor(value) :
+      cardGuidanceVisual({ headline: "Offline", mood: "waiting" }) : cardGuidanceVisual(guidance);
+    root.querySelector(".name").textContent = this._config.name ||
+      state?.attributes?.friendly_name?.replace(metric.nameSuffix, "") || this._config.entity;
+    root.querySelector(".pm-label").innerHTML = metric.labelHtml;
+    root.querySelector(".pm-unit").textContent = metric.unit;
+    root.querySelector(".pm-value").textContent = value == null ? "–" : fmt(value, metric.decimals);
+    scene.dataset.category = cat?.key ?? "offline";
+    scene.dataset.guidanceCategory = guidance.categoryKey ?? "unavailable";
+    scene.style.setProperty("--cat-color", cat?.color ?? "#8b8379");
+    scene.style.setProperty("--cat-sky-top", cat?.sky?.[0] ?? "#e0e0e0");
+    scene.style.setProperty("--cat-sky-bottom", cat?.sky?.[1] ?? "#f5f5f5");
+    scene.style.setProperty("--cat-ground", cat?.ground ?? "#746b5d");
+    root.querySelector(".category").textContent = primary ? cat?.label ?? "Offline" : guidance.headline;
+    root.querySelector(".guidance").textContent = primary ? "" : guidance.advice;
+    root.querySelector(".guidance").title = primary ? "" : guidance.advice;
+    root.querySelector(".mascot").innerHTML = this._mascotSvg(cat?.mood ?? "ok");
+    root.querySelector(".chips").innerHTML = this._chipKeys(metric).map(key => {
+      const r = READINGS[key];
+      const st = r && this._related[key] && hass.states[this._related[key]];
+      const number = this._displayReading(key, st);
+      if (number == null) return "";
+      return `<span class="chip"><ha-icon icon="${r.icon}"></ha-icon>${fmt(number, r.digits)}${r.unit}</span>`;
+    }).join("");
+    if (!root.querySelector(".overlay").hidden) this._renderOverlay();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Expanded view                                                        */
+  /* ------------------------------------------------------------------ */
+
+  async _openOverlay() {
+    if (AirQualityGuidanceCard._openCard && AirQualityGuidanceCard._openCard !== this)
+      AirQualityGuidanceCard._openCard._closeOverlay();
+    const overlay = this.shadowRoot.querySelector(".overlay");
+    if (!overlay.hidden) return;
+    AirQualityGuidanceCard._openCard = this;
+    this._previousOverflow = document.body.style.overflow;
+    this._previousFocus = document.activeElement;
+    overlay.hidden = false;
+    document.body.style.overflow = "hidden";
+    this._escHandler = ev => {
+      if (ev.key === "Escape") this._closeOverlay();
+      if (ev.key === "Tab") {
+        const nodes = [...overlay.querySelectorAll('button:not([disabled]),a[href],summary,[tabindex="0"]')]
+          .filter(node => node.getClientRects().length > 0);
+        const first = nodes[0], last = nodes.at(-1);
+        const active = this.shadowRoot.activeElement;
+        if (ev.shiftKey && active === first) { ev.preventDefault(); last?.focus(); }
+        else if (!ev.shiftKey && active === last) { ev.preventDefault(); first?.focus(); }
+      }
+    };
+    window.addEventListener("keydown", this._escHandler);
+    this._renderOverlay();
+    overlay.querySelector(".close")?.focus();
+    await this._loadStats();
+    if (this.isConnected && !overlay.hidden) this._renderOverlay();
+  }
+
+  _closeOverlay() {
+    const overlay = this.shadowRoot?.querySelector(".overlay");
+    if (overlay) overlay.hidden = true;
+    const tooltip = this.shadowRoot?.querySelector(".tooltip");
+    if (tooltip) tooltip.hidden = true;
+    if (AirQualityGuidanceCard._openCard === this) {
+      document.body.style.overflow = this._previousOverflow ?? "";
+      AirQualityGuidanceCard._openCard = null;
+      if (this._previousFocus?.isConnected) this._previousFocus.focus();
+    }
+    window.removeEventListener("keydown", this._escHandler);
+    this._escHandler = null;
+  }
+
+  async _loadStats() {
+    if (Date.now() - this._statsCacheAt < 5 * 60 * 1000) return;
+    const hass = this._hass;
+    const id = this._config.entity;
+    const generation = this._generation;
+    const now = new Date();
+    const dayMs = 24 * 3600 * 1000;
+    const iso = (d) => new Date(d).toISOString();
+
+    const call = (statId, period, startMs) =>
+      hass
+        .callWS({
+          type: "recorder/statistics_during_period",
+          start_time: iso(startMs),
+          end_time: iso(now),
+          statistic_ids: [statId],
+          period,
+          types: ["mean", "max"],
+        })
+        .then((r) => r?.[statId] ?? [])
+        .catch(() => []);
+
+    const [short, hourly, daily] = this._historyUnitCompatible(this._metric().key) ? await Promise.all([
+      call(id, "5minute", now - dayMs),
+      call(id, "hour", now - 10 * dayMs),
+      call(id, "day", now - 30 * dayMs),
+    ]) : [[], [], []];
+    if (generation !== this._generation) return;
+    this._stats = { short, hourly, daily };
+
+    // A 24 h (5-minute) series for every other discovered reading, so the
+    // expanded view can stack a chart per sensor at the bottom.
+    this._relatedIds(hass.states[id]);
+    const secKeys = Object.keys(this._related).filter(
+      (k) => k !== "primary" && this._related[k] && this._related[k] !== id && this._historyUnitCompatible(k)
+    );
+    const secStats = {};
+    await Promise.all(
+      secKeys.map(async (k) => {
+        secStats[k] = { short: await call(this._related[k], "5minute", now - dayMs) };
+      })
+    );
+    if (generation !== this._generation) return;
+    this._secStats = secStats;
+    this._statsCacheAt = Date.now();
+  }
+
+  _renderOverlay() {
+    const overlay = this.shadowRoot.querySelector(".overlay");
+    const previousScroll = overlay.querySelector(".sheet")?.scrollTop ?? 0;
+    const closeFocused = this.shadowRoot.activeElement?.classList?.contains("close");
+    const hass = this._hass;
+    const metric = this._metric();
+    const state = hass.states[this._config.entity];
+    this._relatedIds(state);
+    // Other discovered readings get their own 24 h chart, stacked below.
+    const secKeys = CHIP_ORDER.filter((k) => k !== metric.key && this._related?.[k] && this._historyUnitCompatible(k));
+    const value = this._displayReading(metric.key, state);
+    const cat = value == null ? null : this._categoryFor(value);
+    const guidance = this._evaluateGuidance();
+    const guidanceMode = this._config.guidance !== "primary";
+    const visual = guidanceMode ? cardGuidanceVisual(guidance) : cat;
+    const headline = guidanceMode ? guidance.headline : cat?.label ?? "Offline";
+    const historyCompatible = this._historyUnitCompatible(metric.key);
+    const stats = historyCompatible ? this._stats ?? { short: [], hourly: [], daily: [] } : { short: [], hourly: [], daily: [] };
+    const startOf = (row) =>
+      typeof row.start === "number" ? row.start : Date.parse(row.start);
+
+    const rowsOfLast = (rows, ms) => {
+      const cutoff = Date.now() - ms;
+      return rows.filter((r) => startOf(r) >= cutoff && r.mean != null);
+    };
+    const meanOfLast = (rows, ms) => {
+      const vals = rowsOfLast(rows, ms).map(row => cardFiniteReading(row.mean)).filter(value => value != null);
+      if (!vals.length) return null;
+      return vals.reduce((a, value) => a + value, 0) / vals.length;
+    };
+    const fine = stats.short.length ? stats.short : stats.hourly;
+    const avg24 = meanOfLast(fine, 24 * 3600e3);
+    const avg12 = meanOfLast(fine, 12 * 3600e3);
+
+    const name = esc(this.shadowRoot.querySelector(".name").textContent);
+    const tile = (title, value, sub) => `
+      <div class="tile">
+        <div class="tile-title">${title}</div>
+        <div class="tile-value">${value}</div>
+        <div class="tile-sub">${sub}</div>
+      </div>`;
+    const pending = (title) => tile(title, "…", "Collecting data — check back soon");
+
+    const rows24 = rowsOfLast(fine, 24 * 3600e3).filter(row => cardFiniteReading(row.max ?? row.mean) != null);
+    const peak24 = rows24.length ? Math.max(...rows24.map(row => Number(row.max ?? row.mean))) : null;
+    const assessment = Array.isArray(guidance.readings) ? guidance.readings.find(item => item.key === metric.key) : guidance.readings?.[metric.key];
+    const coverage = guidance.coverage?.[metric.key];
+    const peakTile = peak24 == null ? pending("Peak recorded — last 24 h") : tile(
+      "Peak recorded — last 24 h", `${fmt(peak24, metric.decimals)} ${metric.unit}`.trim(),
+      "Recorded maximum; not a continuous-exposure or health category");
+    const dailyTile = ["pm25", "pm10", "co2"].includes(metric.key)
+      ? tile("Complete 24-hour mean", assessment?.average24h == null ? "…" :
+          `${fmt(assessment.average24h, metric.decimals)} ${metric.unit}`.trim(),
+          `${coverage?.availableBuckets ?? 0} / ${coverage?.expectedBuckets ?? 288} complete 5-minute means. ${assessment?.average24h == null ? "Collecting data; no guideline comparison yet." : "See guidance and reference above."}`)
+      : tile("Relative gas index", "Not a concentration", "Learned background and event signal; not a gas exposure limit");
+    const extraTiles = peakTile + dailyTile;
+
+    overlay.innerHTML = `
+      <div class="backdrop"></div>
+      <div class="sheet" role="dialog" aria-modal="true" aria-label="${name} air quality details">
+        <button class="close" aria-label="Close">✕</button>
+        <div class="sheet-head" style="--cat-color:${visual?.color ?? "#9e9e9e"}">
+          <svg class="mascot big" viewBox="0 0 80 80">${this._mascotSvg(visual?.mood ?? "ok")}</svg>
+          <div>
+            <div class="sheet-name">${name}</div>
+            <div class="sheet-cat">${esc(headline)}</div>
+            <div class="sheet-pm">${metric.labelHtml} <b>${fmt(value, metric.decimals)}</b> ${metric.unit}</div>
+          </div>
+        </div>
+        ${this._config.guidance === "primary" ? "" : this._guidanceDetails(guidance)}
+        ${historyCompatible ? "" : '<p class="guidance-basis">Primary history is unavailable: its measurement unit is missing or incompatible with the selected metric.</p>'}
+        <div class="tiles">
+          ${tile("Last 24 h", avg24 == null ? "…" : `${fmt(avg24, metric.decimals)} ${metric.unit}`.trim(), `mean of available ${metric.short} samples; may be incomplete`)}
+          ${tile("Last 12 h", avg12 == null ? "…" : `${fmt(avg12, metric.decimals)} ${metric.unit}`.trim(), `mean of available ${metric.short} samples; may be incomplete`)}
+          ${extraTiles}
+        </div>
+        <div class="section">
+          <h3>${metric.labelHtml} — last 24 hours <span class="unit">${metric.unit}</span></h3>
+          <div class="chart24" data-reading="__primary"></div>
+        </div>
+        <div class="section">
+          <h3>${metric.labelHtml} — last 10 days by hour</h3>
+          <div class="heatmap"></div>
+          <div class="legend"></div>
+        </div>
+        ${secKeys.length ? `<h2 class="subhead">Every reading — last 24 hours</h2>` : ""}
+        ${secKeys
+          .map((k) => {
+            const rm = this._readingMetric(k);
+            return `
+        <div class="section">
+          <h3>${rm.labelHtml} — last 24 hours ${rm.unit ? `<span class="unit">${rm.unit}</span>` : ""}</h3>
+          <div class="chart24" data-reading="${k}"></div>
+        </div>`;
+          })
+          .join("")}
+        <div class="attribution">${metric.attribution}</div>
+      </div>`;
+
+    overlay.querySelector(".backdrop").addEventListener("click", () => this._closeOverlay());
+    overlay.querySelector(".close").addEventListener("click", () => this._closeOverlay());
+    overlay.querySelector(".sheet").scrollTop = previousScroll;
+    if (closeFocused) overlay.querySelector(".close").focus({ preventScroll: true });
+
+    this._render24hChart(overlay.querySelector('.chart24[data-reading="__primary"]'), stats, metric);
+    this._renderHeatmap(overlay.querySelector(".heatmap"), stats.hourly);
+    overlay.querySelector(".legend").innerHTML = metric.categories
+      .map((c) => `<span class="lg"><i style="background:${c.color}"></i>${c.label}</span>`)
+      .join("");
+    for (const k of secKeys) {
+      this._render24hChart(
+        overlay.querySelector(`.chart24[data-reading="${k}"]`),
+        this._secStats?.[k] ?? { short: [] },
+        this._readingMetric(k)
+      );
+    }
+  }
+
+  _hourLabel(date) {
+    return date.toLocaleTimeString(this._hass?.locale?.language, { hour: "numeric" });
+  }
+
+  _render24hChart(el, stats, metric = this._metric()) {
+    // 48 half-hour buckets from 5-minute statistics; hourly fallback.
+    const now = Date.now();
+    const bucketMs = 30 * 60e3;
+    const src = stats.short?.length ? stats.short : stats.hourly ?? [];
+    const startOf = (r) => (typeof r.start === "number" ? r.start : Date.parse(r.start));
+    const buckets = new Array(48).fill(null).map(() => []);
+    const t0 = now - 48 * bucketMs;
+    for (const r of src) {
+      const mean = cardFiniteReading(r.mean);
+      if (mean == null) continue;
+      const i = Math.floor((startOf(r) - t0) / bucketMs);
+      if (i >= 0 && i < 48) buckets[i].push(mean);
+    }
+    const values = buckets.map((b) =>
+      b.length ? b.reduce((a, v) => a + v, 0) / b.length : null
+    );
+    if (!values.some((v) => v != null)) {
+      el.innerHTML = `<div class="empty">No history yet — the chart fills in as Home Assistant records data.</div>`;
+      return;
+    }
+
+    const W = 520, H = 150, padL = 30, padB = 20, padT = 8;
+    const plotW = W - padL - 6, plotH = H - padT - padB;
+    const maxV = Math.max(metric.chartFloor, ...values.filter((v) => v != null)) * 1.15;
+    const bw = plotW / 48;
+    const y = (v) => padT + plotH - (v / maxV) * plotH;
+
+    let bars = "", hits = "";
+    values.forEach((v, i) => {
+      const x = padL + i * bw;
+      if (v != null) {
+        const c = this._catForMetric(metric, v);
+        const h = Math.max(2, plotH - (y(v) - padT));
+        bars += `<rect x="${(x + 0.75).toFixed(1)}" y="${y(v).toFixed(1)}" width="${(bw - 1.5).toFixed(1)}" height="${h.toFixed(1)}" rx="2" fill="${c.color}" stroke="rgba(0,0,0,.14)" stroke-width="0.5"/>`;
+      }
+      const when = new Date(t0 + i * bucketMs);
+      hits += `<rect class="hit" x="${x}" y="0" width="${bw}" height="${H - padB}" fill="transparent"
+        data-tip="${v == null ? "no data" : `${fmt(v, metric.decimals)} ${metric.unit} · ${this._catForMetric(metric, v).label}`.trim()} — ${this._hourLabel(when)}"/>`;
+    });
+
+    const ticks = [0, Math.round(maxV / 2), Math.round(maxV)];
+    const grid = ticks
+      .map(
+        (t) => `
+        <line x1="${padL}" y1="${y(t)}" x2="${W - 6}" y2="${y(t)}" class="grid"/>
+        <text x="${padL - 5}" y="${y(t) + 3}" class="axis" text-anchor="end">${t}</text>`
+      )
+      .join("");
+    let hourTicks = "";
+    for (let i = 0; i < 48; i += 8) {
+      const when = new Date(t0 + i * bucketMs);
+      hourTicks += `<text x="${padL + i * bw}" y="${H - 6}" class="axis">${this._hourLabel(when)}</text>`;
+    }
+
+    el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="chart">${grid}${bars}${hourTicks}${hits}</svg>`;
+    this._attachTooltips(el);
+  }
+
+  _renderHeatmap(el, hourly) {
+    const metric = this._metric();
+    const startOf = (r) => (typeof r.start === "number" ? r.start : Date.parse(r.start));
+    const byKey = new Map();
+    for (const r of hourly) {
+      const mean = cardFiniteReading(r.mean);
+      if (mean == null || !Number.isFinite(startOf(r))) continue;
+      const d = new Date(startOf(r));
+      byKey.set(`${d.toDateString()}|${d.getHours()}`, mean);
+    }
+    if (!byKey.size) {
+      el.innerHTML = `<div class="empty">No hourly statistics yet — this view builds up over the next days.</div>`;
+      return;
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    let rows = "";
+    for (let day = 0; day < 10; day++) {
+      const date = new Date(today.getTime() - day * 24 * 3600e3);
+      const label =
+        day === 0 ? "Today" : day === 1 ? "Yesterday"
+        : date.toLocaleDateString(this._hass?.locale?.language, { weekday: "long" });
+      let cells = "";
+      for (let h = 0; h < 24; h++) {
+        const v = byKey.get(`${date.toDateString()}|${h}`);
+        if (v == null) {
+          cells += `<i class="cell empty-cell" data-tip="no data — ${label} ${h}:00"></i>`;
+        } else {
+          const c = this._categoryFor(v);
+          cells += `<i class="cell" style="background:${c.color}" data-tip="${fmt(v, metric.decimals)} ${metric.unit} · ${c.label} — ${label} ${h}:00"></i>`;
+        }
+      }
+      rows += `<div class="hm-row">${cells}<span class="hm-label">${label}</span></div>`;
+    }
+    let hours = "";
+    for (let h = 0; h < 24; h += 6) hours += `<span style="grid-column:${h + 1}">${String(h).padStart(2, "0")}</span>`;
+    el.innerHTML = `<div class="hm-hours">${hours}</div>${rows}`;
+    this._attachTooltips(el);
+  }
+
+  _attachTooltips(scope) {
+    const tooltip = this.shadowRoot.querySelector(".tooltip");
+    scope.querySelectorAll("[data-tip]").forEach((node) => {
+      node.addEventListener("mouseenter", () => {
+        tooltip.textContent = node.dataset.tip;
+        tooltip.hidden = false;
+      });
+      node.addEventListener("mousemove", (ev) => {
+        tooltip.style.left = `${Math.min(ev.clientX + 12, window.innerWidth - 180)}px`;
+        tooltip.style.top = `${ev.clientY + 14}px`;
+      });
+      node.addEventListener("mouseleave", () => (tooltip.hidden = true));
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
+
+  static styles = `
+    .titles { min-width: 0; }
+    .guidance { font-size: 11px; line-height: 12px; margin-top: 3px; max-height: 24px;
+      display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+      overflow: hidden; color: rgba(0,0,0,.78); }
+    .guidance:empty { display: none; }
+    .guidance-details { border: 1px solid var(--divider-color,#ddd); border-radius: 12px;
+      padding: 12px; margin-bottom: 16px; }
+    .guidance-details h2 { font-size: 1.15rem; margin: 0 0 6px; }
+    .guidance-details p { margin: 6px 0; }
+    .guidance-basis { font-size: .85rem; color: var(--secondary-text-color,#666); }
+    .guidance-readings { list-style: none; padding: 0; }
+    .guidance-readings li { margin: 10px 0; }
+    .guidance-readings span { display: block; font-size: .82rem; }
+    .guidance-references summary { min-height: 44px; display: flex; align-items: center;
+      cursor: pointer; }
+    .guidance-references a { display: inline-flex; align-items: center; min-height: 44px;
+      color: var(--primary-color,#1565c0); overflow-wrap: anywhere; }
+
+    :host { display: block; }
+    ha-card { overflow: hidden; }
+    .scene {
+      position: relative; height: 190px; cursor: pointer; outline: none;
+      display: flex; flex-direction: column; justify-content: space-between;
+    }
+    .scene:focus-visible { box-shadow: inset 0 0 0 2px var(--primary-color); }
+    .sky { position: absolute; inset: 0;
+      background: linear-gradient(var(--cat-sky-top, #dcf3dd), var(--cat-sky-bottom, #f2faf0)); }
+    .scene[data-category="offline"] .sky { background: linear-gradient(#e0e0e0, #f5f5f5); }
+    .clouds { position: absolute; inset: 0; overflow: hidden; }
+    .cloud { position: absolute; background: rgba(255,255,255,.85); border-radius: 999px; }
+    .cloud::before, .cloud::after { content:""; position:absolute; background:inherit; border-radius:999px; }
+    .c1 { width: 52px; height: 14px; top: 26px; animation: drift 46s linear infinite; }
+    .c1::before { width: 22px; height: 18px; top: -9px; left: 9px; }
+    .c2 { width: 38px; height: 11px; top: 58px; animation: drift 64s linear infinite; animation-delay: -30s; }
+    .c2::before { width: 16px; height: 13px; top: -7px; left: 8px; }
+    .c3 { width: 30px; height: 9px; top: 14px; animation: drift 80s linear infinite; animation-delay: -55s; }
+    .c3::before { width: 13px; height: 11px; top: -5px; left: 7px; }
+    @keyframes drift { from { left: -70px; } to { left: 105%; } }
+    .hills { position: absolute; left: 0; right: 0; bottom: 34px; height: 80px; width: 100%; }
+    .hill-back { fill: var(--cat-ground, #66bb6a); opacity: .45; }
+    .hill-front { fill: var(--cat-ground, #66bb6a); opacity: .8; }
+    .trunk { fill: #7a5b41; }
+    .leaves { fill: var(--cat-ground, #2e7d32); filter: brightness(.72); }
+    .tree { transform-box: fill-box; transform-origin: bottom center; }
+    .head { position: relative; display: flex; justify-content: space-between; padding: 14px 16px 0; }
+    .name { font-size: 1.05rem; font-weight: 600; color: rgba(0,0,0,.75); }
+    .category { font-size: 1.5rem; font-weight: 700; color: rgba(0,0,0,.85); line-height: 1.2; max-width: 70%; }
+    .mascot-badge {
+      width: 64px; height: 64px; border-radius: 50%; flex: none;
+      background: rgba(255,255,255,.75); border: 3px solid var(--cat-color, #43a047);
+      display: grid; place-items: center; animation: bob 4s ease-in-out infinite;
+    }
+    @keyframes bob { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+    .mascot { width: 52px; height: 52px; }
+    .mascot .body { fill: #fff; stroke: rgba(0,0,0,.18); stroke-width: 1.5; }
+    .mascot .cap { fill: var(--cat-color, #43a047); opacity: .9; }
+    .mascot .eye { fill: #37474f; }
+    .mascot .mouth, .mascot .brow { stroke: #37474f; stroke-width: 2.4; fill: none; stroke-linecap: round; }
+    .mascot .blush { fill: #f8bbd0; }
+    .strip {
+      position: relative; display: flex; justify-content: space-between; align-items: center;
+      padding: 8px 16px; background: var(--cat-color, #43a047); color: #fff;
+    }
+    .scene[data-category="moderate"] .strip { color: rgba(0,0,0,.8); }
+    .scene[data-category="offline"] .strip { background: #9e9e9e; }
+    .pm-value { font-size: 1.25rem; }
+    .chips { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px 10px; font-size: .9rem; }
+    .chip { display: inline-flex; align-items: center; gap: 2px; }
+    .chip ha-icon { --mdc-icon-size: 16px; }
+
+    /* Expanded sheet */
+    .overlay { position: fixed; inset: 0; z-index: 9999; pointer-events: auto; }
+    .overlay[hidden] { display: none !important; }
+    .backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.45); }
+    .sheet {
+      position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+      max-height: calc(100% - 48px);
+      width: min(620px, calc(100vw - 24px));
+      background: var(--card-background-color, #fff); color: var(--primary-text-color, #212121);
+      border-radius: 16px; overflow-y: auto; padding: 20px; box-sizing: border-box;
+      box-shadow: 0 8px 40px rgba(0,0,0,.4);
+    }
+    .close {
+      position: absolute; top: 12px; right: 12px; border: none; cursor: pointer;
+      width: 44px; height: 44px; border-radius: 50%; font-size: 18px;
+      background: var(--secondary-background-color, #eee); color: var(--primary-text-color, #212121);
+    }
+    .sheet-head { display: flex; gap: 16px; align-items: center; margin-bottom: 16px;
+      padding-right: 44px; }
+    .sheet-head > div { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+    .mascot.big { width: 72px; height: 72px; flex: none; }
+    .sheet-name { font-weight: 600; }
+    .sheet-cat { font-size: 1.6rem; font-weight: 700; color: var(--cat-color); }
+    .sheet-pm b { font-size: 1.15rem; }
+    .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+    .tile { background: var(--secondary-background-color, #f5f5f5); border-radius: 12px; padding: 12px; }
+    .tile-title { font-size: .8rem; color: var(--secondary-text-color, #666); }
+    .tile-value { font-size: 1.4rem; font-weight: 700; margin: 2px 0; }
+    .tile-sub { font-size: .75rem; color: var(--secondary-text-color, #666); }
+    .section { margin-top: 20px; }
+    .section h3 { font-size: .95rem; margin: 0 0 8px; }
+    .subhead { font-size: 1.05rem; margin: 26px 0 0; padding-top: 18px;
+      border-top: 1px solid var(--divider-color, #e0e0e0); }
+    .section .unit { font-weight: 400; font-size: .75rem; color: var(--secondary-text-color, #666); }
+    .chart { width: 100%; height: auto; }
+    .grid { stroke: var(--divider-color, #e0e0e0); stroke-width: 1; }
+    .axis { font-size: 9px; fill: var(--secondary-text-color, #666); }
+    .empty { font-size: .85rem; color: var(--secondary-text-color, #666); padding: 12px 0; }
+    .hm-hours { display: grid; grid-template-columns: repeat(24, 1fr); font-size: .65rem;
+      color: var(--secondary-text-color, #666); margin: 0 84px 3px 0; }
+    .hm-row { display: grid; grid-template-columns: repeat(24, 1fr) 84px; gap: 3px; margin-bottom: 3px; align-items: center; }
+    .cell { display: block; aspect-ratio: 1; border-radius: 3px; min-width: 0;
+      box-shadow: inset 0 0 0 0.5px rgba(0,0,0,.12); }
+    .empty-cell { background: transparent; box-shadow: inset 0 0 0 1px var(--divider-color, #e0e0e0); }
+    .hm-label { font-size: .72rem; color: var(--secondary-text-color, #666); padding-left: 6px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 10px; font-size: .72rem;
+      color: var(--secondary-text-color, #666); }
+    .lg { display: inline-flex; align-items: center; gap: 4px; }
+    .lg i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+    .attribution { margin-top: 18px; font-size: .72rem; color: var(--secondary-text-color, #666); }
+    .attribution a { color: inherit; }
+    .tooltip {
+      position: fixed; z-index: 10000; pointer-events: none; max-width: 170px;
+      background: rgba(33,33,33,.94); color: #fff; font-size: .74rem;
+      padding: 5px 8px; border-radius: 6px;
+    }
+    @media (max-width: 400px) {
+      .sheet-head { gap: 12px; padding-right: 36px; }
+      .mascot.big { width: 48px; height: 48px; }
+      .sheet-cat { font-size: 1.2rem; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .cloud, .tree, .mascot-badge { animation: none; }
+    }
+  `;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Visual editor                                                            */
+/* ---------------------------------------------------------------------- */
+
+export class AirQualityGuidanceCardEditor extends HTMLElement {
+  setConfig(config) {
+    this._config = config;
+    this._render();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (this._form) this._form.hass = hass;
+  }
+
+  async _render() {
+    if (!this._form) {
+      // Make sure ha-form and its selectors are registered.
+      const helpers = await window.loadCardHelpers?.();
+      await helpers?.createCardElement({ type: "entities", entities: [] })
+        ?.constructor?.getConfigElement?.();
+      this._form = document.createElement("ha-form");
+      this._form.computeLabel = (s) => {
+        const fixed = {
+          metric: "Primary reading (number and charts)",
+          guidance: "Headline guidance",
+          entity: "Sensor",
+          name: "Name (optional)",
+          chips_mode: "Secondary chips",
+          chips_items: "Readings to show",
+        };
+        if (fixed[s.name]) return fixed[s.name];
+        if (READING_LABELS[s.name]) return `${READING_LABELS[s.name]} sensor (auto-detected)`;
+        return s.name;
+      };
+      this._form.addEventListener("value-changed", (ev) => {
+        const config = this._configFromForm(ev.detail.value);
+        this.dispatchEvent(
+          new CustomEvent("config-changed", { detail: { config }, bubbles: true, composed: true })
+        );
+      });
+      this.appendChild(this._form);
+    }
+    const cfg = this._config ?? {};
+    const metric = cfg.metric ?? "pm25";
+    // VOC/NOx indices carry no device_class, so the entity picker can't filter
+    // by one — offer any sensor for those.
+    const entityDc = { pm25: "pm25", co2: "carbon_dioxide", pm10: "pm10" }[metric];
+
+    // Chips: an array in config means "custom"; otherwise it's the string mode.
+    // Never offer the headline reading as a chip — it's already the big number.
+    const rawChips = cfg.chips ?? "auto";
+    const mode = Array.isArray(rawChips) ? "custom" : rawChips;
+    const allItems = CHIP_ORDER.filter((k) => k !== metric);
+    const items = (Array.isArray(rawChips) ? rawChips : allItems).filter((k) => k !== metric);
+
+    this._form.hass = this._hass;
+    this._form.data = {
+      metric,
+      entity: cfg.entity,
+      name: cfg.name,
+      guidance: cfg.guidance ?? "all_available",
+      chips_mode: mode,
+      chips_items: items,
+      ...Object.fromEntries(Object.keys(READINGS).map((k) => [k, cfg[k]]).filter(([, v]) => v != null)),
+    };
+
+    const schema = [
+      {
+        name: "metric",
+        selector: {
+          select: {
+            mode: "dropdown",
+            options: [
+              { value: "pm25", label: "PM2.5 — US EPA categories" },
+              { value: "co2", label: "CO₂ — ventilation categories" },
+              { value: "pm10", label: "PM10 — US EPA categories" },
+              { value: "voc", label: "VOC index — Sensirion scale" },
+              { value: "nox", label: "NOx index — Sensirion scale" },
+            ],
+          },
+        },
+      },
+      {
+        name: "entity",
+        required: true,
+        selector: {
+          entity: entityDc ? { domain: "sensor", device_class: entityDc } : { domain: "sensor" },
+        },
+      },
+      { name: "name", selector: { text: {} } },
+      { name: "guidance", selector: { select: { mode: "dropdown", options: [
+        { value: "all_available", label: "All available readings" },
+        { value: "primary", label: "Primary reading only (legacy)" },
+      ] } } },
+      {
+        name: "chips_mode",
+        selector: {
+          select: {
+            mode: "dropdown",
+            options: [
+              { value: "auto", label: "All readings on the device" },
+              { value: "minimal", label: "Minimal — temperature, humidity & one pollutant" },
+              { value: "custom", label: "Customise — pick readings & assign sensors" },
+            ],
+          },
+        },
+      },
+    ];
+
+    if (mode === "custom") {
+      // Tick which readings to show…
+      schema.push({
+        name: "chips_items",
+        selector: {
+          select: {
+            multiple: true,
+            mode: "list",
+            options: allItems.map((k) => ({ value: k, label: READING_LABELS[k] ?? k })),
+          },
+        },
+      });
+      // …then assign a sensor to each ticked one (blank = auto-detect from the device).
+      for (const k of items) {
+        const dc = READINGS[k]?.dc;
+        schema.push({
+          name: k,
+          selector: { entity: dc ? { domain: "sensor", device_class: dc } : { domain: "sensor" } },
+        });
+      }
+    }
+
+    this._form.schema = schema;
+  }
+
+  /** Translate the editor form's values (which use synthetic chips_mode /
+   *  chips_items fields) back into a real card config. */
+  _configFromForm(v) {
+    const config = { ...this._config, type: "custom:air-quality-guidance-card", metric: v.metric, entity: v.entity };
+    if (v.guidance) config.guidance = v.guidance;
+    if (v.name) config.name = v.name;
+    else delete config.name;
+
+    if (v.chips_mode === "custom") {
+      const list = Array.isArray(v.chips_items)
+        ? v.chips_items
+        : CHIP_ORDER.filter((k) => k !== v.metric);
+      config.chips = list.filter((k) => k !== v.metric);
+    } else if (v.chips_mode === "minimal") {
+      config.chips = "minimal";
+    } else {
+      config.chips = "auto";
+    }
+
+    // Per-reading entity overrides (only those the form currently carries).
+    for (const k of Object.keys(READINGS)) {
+      if (v[k]) config[k] = v[k];
+    }
+    return config;
+  }
+}
+
+// Evaluated twice when loaded both via `frontend: extra_module_url:` and as a
+// HACS Lovelace resource (the ?hacstag= query string makes it a distinct
+// module). Re-defining a tag throws, so guard every registration.
+if (!customElements.get("air-quality-guidance-card")) {
+  customElements.define("air-quality-guidance-card", AirQualityGuidanceCard);
+}
+if (!customElements.get("air-quality-guidance-card-editor")) {
+  customElements.define("air-quality-guidance-card-editor", AirQualityGuidanceCardEditor);
+}
+
+window.customCards = window.customCards || [];
+if (!window.customCards.some((c) => c.type === "air-quality-guidance-card")) {
+  window.customCards.push({
+    type: "air-quality-guidance-card",
+    name: "Air Quality Guidance Card",
+    description:
+      "Animated air-quality card for PM2.5, CO₂, PM10, VOC or NOx, with auto-discovered chips and tap-to-expand charts and history.",
+    preview: true,
+    documentationURL: "https://github.com/JeremyRitchie/air-quality-guidance-card",
+  });
+  console.info(
+    `%c AIR-QUALITY-GUIDANCE-CARD %c v${CARD_VERSION} `,
+    "color:#fff;background:#43a047;font-weight:700;border-radius:3px 0 0 3px",
+    "color:#43a047;background:#dcf3dd;border-radius:0 3px 3px 0"
+  );
+}

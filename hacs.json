@@ -1,6 +1,6 @@
 {
-  "name": "Air Quality Scene Card",
+  "name": "Air Quality Guidance Card",
   "render_readme": true,
-  "filename": "air-quality-scene-card.js",
+  "filename": "air-quality-guidance-card.js",
   "homeassistant": "2024.6.0"
 }
