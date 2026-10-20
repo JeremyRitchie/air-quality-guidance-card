@@ -261,3 +261,141 @@ test('historical means with an incompatible current sensor unit cannot support a
   assert.equal(result.flags.length, 0);
   assert.equal(result.readings[0].average24h, undefined);
 });
+
+const practical = (readings, samples = {}) => evaluate(readings, samples, { policy: { profile: 'practical' } });
+
+test('practical profile keeps routine variation and isolated spikes out of the headline', () => {
+  for (const [key, value, unit] of [['pm25', 20, 'µg/m³'], ['pm10', 70, 'µg/m³'],
+    ['co2', 1200, 'ppm'], ['voc', 180, ''], ['nox', 30, ''], ['humidity', 56, '%']]) {
+    const result = practical({ [key]: reading(value, unit) });
+    assert.equal(result.headline, 'No current attention flags', key);
+    assert.equal(result.flags.length, 0, key);
+    assert.equal(result.mood, 'calm', key);
+  }
+  const pulse = practical({ co2: reading(2500, 'ppm') }, { co2: buckets(2500, 1) });
+  assert.equal(pulse.flags.length, 0);
+  assert.equal(pulse.readings[0].status, 'info');
+  assert.match(pulse.readings[0].reason, /Checking recent trend; no persistence yet/);
+});
+
+test('practical pollutant attention gates need every complete mean and current evidence', () => {
+  for (const [key, slow, fast, unit, exclusive] of [['pm25', 35, 75, 'µg/m³', false],
+    ['pm10', 100, 150, 'µg/m³', false], ['co2', 1500, 2000, 'ppm', true],
+    ['voc', 250, 400, '', false], ['nox', 150, 300, '', false]]) {
+    const value = slow + (exclusive ? 0.1 : 0);
+    const slowResult = practical({ [key]: reading(value, unit) }, { [key]: buckets(value, 6) });
+    assert.equal(slowResult.categoryKey, `${key}_persistent`, key);
+    assert.equal(slowResult.severity, 2, key);
+    assert.equal(slowResult.mood, 'act', key);
+    const fastResult = practical({ [key]: reading(fast, unit) }, { [key]: buckets(fast, 2) });
+    assert.equal(fastResult.severity, 3, key);
+    assert.equal(fastResult.readings[0].persistence.minutes, 10, key);
+    for (const rows of [buckets(value, 5), [...buckets(value, 6).slice(0, 2), ...buckets(value, 6).slice(3)],
+      buckets(value, 6).map((row, index) => index === 2 ? { ...row, mean: slow - 1 } : row)]) {
+      assert.equal(practical({ [key]: reading(value, unit) }, { [key]: rows }).flags.length, 0, key);
+    }
+    assert.equal(practical({ [key]: reading(slow - 0.1, unit) }, { [key]: buckets(value, 6) }).flags.length, 0, key);
+    assert.equal(practical({ [key]: reading(fast, unit) }, { [key]: buckets(fast, 1) }).flags.length, 0, key);
+  }
+});
+
+test('practical CO₂1500 slow boundary is exclusive, while2000 fast boundary is inclusive', () => {
+  assert.equal(practical({ co2: reading(1500, 'ppm') }, { co2: buckets(1500, 6) }).flags.length, 0);
+  assert.equal(practical({ co2: reading(1500.1, 'ppm') }, { co2: buckets(1500.1, 6) }).severity, 2);
+  assert.equal(practical({ co2: reading(2000, 'ppm') }, { co2: buckets(2000, 2) }).severity, 3);
+  assert.equal(practical({ co2: reading(1999.9, 'ppm') }, { co2: buckets(2000, 2) }).flags.length, 0);
+});
+
+test('practical trends reject stale, unavailable, invalid-unit and invalid historical readings', () => {
+  for (const current of [reading(2500, 'ppm', { lastReported: NOW - 86400000 }),
+    reading(null, 'ppm', { available: false }), reading(2500, 'µg/m³')]) {
+    const result = practical({ co2: current }, { co2: buckets(2500, 2) });
+    assert.equal(result.flags.length, 0);
+    assert.equal(result.partial, true);
+  }
+  for (const key of ['voc', 'nox']) {
+    const invalid = buckets(450, 2);invalid[0].mean = 501;
+    assert.equal(practical({ [key]: reading(450, '') }, { [key]: invalid }).flags.length, 0);
+    invalid[0].mean = 0;
+    assert.equal(practical({ [key]: reading(450, '') }, { [key]: invalid }).flags.length, 0);
+  }
+  const duplicate = buckets(2500, 2);duplicate.push({ ...duplicate[0], mean: 900 });
+  assert.equal(practical({ co2: reading(2500, 'ppm') }, { co2: duplicate }).flags.length, 0);
+});
+
+test('practical daily WHO and HC comparisons remain lower-priority advisories even after improvement', () => {
+  for (const [key, threshold, current, unit] of [['pm25', 15, 2, 'µg/m³'],
+    ['pm10', 45, 5, 'µg/m³'], ['co2', 1000, 600, 'ppm']]) {
+    assert.equal(practical({ [key]: reading(current, unit) }, { [key]: buckets(threshold) }).flags.length, 0);
+    for (const live of [reading(current, unit), reading(null, unit, { available: false })]) {
+      const result = practical({ [key]: live }, { [key]: buckets(threshold + 1) });
+      assert.equal(result.categoryKey, `${key}_24h`);
+      assert.equal(result.severity, 1);
+      assert.equal(result.mood, 'watch');
+      assert.equal(result.flags[0].advisory, true);
+      assert.match(result.headline, /daily average above guideline/);
+      assert.match(result.flags[0].reason, /not an acute or emergency/);
+    }
+  }
+  const gap = buckets(30).slice(1);
+  assert.equal(practical({ pm25: reading(2, 'µg/m³') }, { pm25: gap }).flags.length, 0);
+});
+
+test('practical live attention outranks daily advice and combines the required actions', () => {
+  const result = practical({ pm25: reading(2, 'µg/m³'), co2: reading(2000, 'ppm'), nox: reading(300, '') },
+    { pm25: buckets(20), co2: buckets(2000, 2), nox: buckets(300, 2) });
+  assert.equal(result.driver, 'co2');
+  assert.equal(result.headline, 'Several persistent issues');
+  assert.equal(result.mood, 'act');
+  assert.equal(result.flags.length, 3);
+  assert.match(result.advice, /particle filtration/);
+  assert.match(result.advice, /filtration does not remove CO₂/);
+  assert.match(result.advice, /combustion/);
+  assert.match(result.flags.find(flag => flag.key === 'co2').basis, /workplace ventilation indicator/);
+});
+
+test('practical humidity56% is normal; only above65% across12means raises attention', () => {
+  for (const value of [25, 30, 50, 56, 60]) {
+    const result = practical({ humidity: reading(value, '%') }, { humidity: buckets(value, 12) });
+    assert.equal(result.flags.length, 0, String(value));
+    assert.equal(result.readings[0].status, 'ok', String(value));
+  }
+  const high = practical({ humidity: reading(65.1, '%') }, { humidity: buckets(65.1, 12) });
+  assert.equal(high.categoryKey, 'humidity_persistent_high');assert.equal(high.severity, 2);
+  assert.equal(practical({ humidity: reading(66, '%') }, { humidity: buckets(66, 11) }).flags.length, 0);
+  const mixed = buckets(66, 12);mixed[2].mean = 65;
+  assert.equal(practical({ humidity: reading(66, '%') }, { humidity: mixed }).flags.length, 0);
+});
+
+test('practical humidity moisture/dryness advisories stay quiet in readings only', () => {
+  for (const value of [24.9, 60.1, 65]) {
+    const result = practical({ humidity: reading(value, '%') }, { humidity: buckets(value, 12) });
+    assert.equal(result.headline, 'No current attention flags');
+    assert.equal(result.flags.length, 0);
+    assert.equal(result.readings[0].status, 'info');
+    assert.match(result.readings[0].reason, /Quiet .* advisory/);
+  }
+  const rising = practical({ humidity: reading(66, '%') }, { humidity: buckets(61, 12) });
+  assert.equal(rising.flags.length, 0);assert.match(rising.readings[0].reason, /Quiet moisture advisory/);
+  const incomplete = practical({ humidity: reading(20, '%') }, { humidity: buckets(20, 11) });
+  assert.match(incomplete.readings[0].reason, /Checking recent humidity trend/);
+});
+
+test('practical relative gas flags remain event guidance rather than concentration or health scores', () => {
+  const result = practical({ voc: reading(400, ''), nox: reading(300, '') },
+    { voc: buckets(400, 2), nox: buckets(300, 2) });
+  assert.equal(result.flags.length, 2);
+  for (const flag of result.flags) {
+    assert.match(flag.headline, /relative .* event/);
+    assert.match(flag.basis, /not a gas concentration or health-risk score/);
+    assert.doesNotMatch(flag.headline, /danger|unsafe|hazard|NO₂|ppb/i);
+  }
+});
+
+test('practical missing data stay explicit and PM1/PM4/temperature remain context only', () => {
+  assert.equal(practical({}).headline, 'Waiting for readings');
+  const partial = practical({ pm25: reading(null, 'µg/m³'), co2: reading(800, 'ppm') });
+  assert.equal(partial.headline, 'Limited sensor data');assert.equal(partial.partial, true);
+  const context = practical({ pm1: reading(999, 'µg/m³'), pm4: reading(999, 'µg/m³'), temperature: reading(-5, '°C') });
+  assert.equal(context.flags.length, 0);assert.equal(context.headline, 'No current attention flags');
+});

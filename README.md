@@ -1,16 +1,16 @@
 # Air Quality Guidance Card
 
-A Home Assistant dashboard card that keeps the artwork and recorded-history views of [keranm/air-quality-scene-card](https://github.com/keranm/air-quality-scene-card), while giving the headline and mascot guidance from the available readings on the device. Fork version **2.0.0**, based on upstream **1.3.1**. MIT attribution and the original bundle are retained.
+A Home Assistant dashboard card that keeps the artwork and recorded-history views of [keranm/air-quality-scene-card](https://github.com/keranm/air-quality-scene-card), while giving the headline and mascot guidance from the available readings on the device. Fork version **2.0.1**, based on upstream **1.3.1**. MIT attribution and the original bundle are retained.
 
 The headline can respond to PM2.5, PM10, CO₂, relative VOC/NOx events and humidity. PM1, PM4 and temperature remain useful context without invented health cutoffs. A hidden chip still participates in guidance. “No sensor flags” means no configured rule is currently flagged; it is **not a composite AQI, health score or assurance that every pollutant is low**.
 
 ## Install alongside the original
 
-Add `https://github.com/JeremyRitchie/air-quality-guidance-card` as a HACS custom **Dashboard** repository. Download version 2.0.0 and reload the browser. HACS uses the explicit `air-quality-guidance-card.js` filename in `hacs.json`.
+Add `https://github.com/JeremyRitchie/air-quality-guidance-card` as a HACS custom **Dashboard** repository. Download version 2.0.1 and reload the browser. HACS uses the explicit `air-quality-guidance-card.js` filename in `hacs.json`.
 
 The new type is `custom:air-quality-guidance-card`, with a distinct editor. Keep the original resource if other views still use `custom:air-quality-scene-card`; there is no load-order conflict. The original `dist/air-quality-scene-card.js` remains unchanged for reference/rollback, but the resource to register for this fork is **`dist/air-quality-guidance-card.js`**.
 
-Manual alternative: copy the new bundle to `/config/www/air-quality-guidance-card.js`, register `/local/air-quality-guidance-card.js?v=2.0.0` as a JavaScript module, and reload the browser. No backend integration or HA restart is required.
+Manual alternative: copy the new bundle to `/config/www/air-quality-guidance-card.js`, register `/local/air-quality-guidance-card.js?v=2.0.1` as a JavaScript module, and reload the browser. No backend integration or HA restart is required.
 
 ```yaml
 type: custom:air-quality-guidance-card
@@ -32,7 +32,29 @@ chips: [temperature, humidity, co2, voc, nox]
 
 `entity` and `metric` still select the big numeric reading, its unit, and the primary history charts. `guidance` is `all_available` by default; `primary` restores a primary-only scene headline. The visual editor retains YAML-only settings. Optional `guidance_policy` overrides are documented by `DEFAULT_POLICY` in `src/guidance.js`; agency 24-hour comparison values remain fixed when local live-screening thresholds change.
 
-## How guidance is interpreted
+## Practical attention profile
+
+To keep routine changes from taking over the headline, opt in per card:
+
+```yaml
+guidance: all_available
+guidance_policy:
+  profile: practical
+```
+
+The original evidence-aware profile remains the default for compatibility. Practical mode distinguishes routine trends, persistent attention cues and complete daily-reference advisories. These operational gates are **local display choices, not agency safe/unsafe or acute-health limits**:
+
+* **PM2.5:** six complete five-minute means at or above 35 µg/m³, or two at or above 75. **PM10:** six at or above 100, or two at or above 150. The compatible current reading must still meet the same gate.
+* **CO₂:** six complete five-minute means above 1,500 ppm, or two at or above 2,000, plus a current reading meeting that gate. [HSE](https://www.hse.gov.uk/ventilation/using-co2-monitors.htm) identifies consistently high CO₂ as a workplace ventilation indicator; the timing and fast gate here are local choices, not a residential exposure limit.
+* **VOC/NOx indices:** six complete five-minute means at or above VOC 250 / NOx 150, or two at or above VOC 400 / NOx 300, plus a matching current value. These use Sensirion example control bands for **relative events**, with locally chosen persistence. They are not pollutant concentrations or a medical risk score.
+* **Humidity:** a current reading above 65% and twelve complete five-minute means above 65% produce an attention cue. Sustained readings above 60%, or below 25%, remain quiet moisture/comfort advisories. A bedroom at 56% produces no humidity warning. [EPA](https://www.epa.gov/mold/mold-course-chapter-9) recommends below 60%, ideally 30–50%; the 65%, 25% and one-hour tolerance choices are local, not agency thresholds.
+* **Daily references remain separate:** all 288 complete five-minute means are still required for WHO PM2.5 >15 / PM10 >45 µg/m³ and Health Canada CO₂ >1,000 ppm comparisons. These stay lower-priority daily advisories even if current readings have improved; the practical live gates never replace them.
+
+Every expected five-minute mean must meet a persistence gate; a single spike cannot pull a window average across it. Missing intervals do not establish persistence. Say “six elevated five-minute means,” not “every instant stayed elevated.” Short cooking or shower peaks stay visible in the measurements and trends without an attention headline. A prolonged strong event can still warrant source control even when cooking caused it. PM1, PM4 and temperature remain context only.
+
+“No current attention flags” means no local persistent rule is active; it does not certify safe air. Missing sensors and incomplete recorder history remain explicit. The card does not identify the pollutant source or infer that a source is harmless. The [EPA indoor-smoke guide, section 5.5](https://nepis.epa.gov/Exe/ZyPURL.cgi?Dockey=P101HCVK.txt) supports smoothing erratic short readings; it does not prescribe these exact local gates.
+
+## Default profile and measurement interpretation
 
 * **Particles:** WHO 2021 24-hour guideline concentrations are PM2.5 15 µg/m³ and PM10 45 µg/m³. A guideline comparison requires all **288 aligned, complete five-minute mean buckets** in the last 24 hours. Current readings at these values are local screening cues, not WHO instantaneous limits. PM1 and PM4 do not borrow the PM2.5 health scale.
 * **CO₂:** Health Canada recommends 1,000 ppm as a 24-hour average. Current elevation is separately labelled screening information. Suitable particle filtration does not remove CO₂; advice distinguishes source control, filtration and fresh-air ventilation when outdoor conditions permit.

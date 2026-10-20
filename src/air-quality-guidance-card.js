@@ -183,7 +183,7 @@ const READING_LABELS = {
   nox: "NOx index",
 };
 
-const CARD_VERSION = "2.0.0";
+const CARD_VERSION = "2.0.1";
 
 const fmt = (v, digits = 1) =>
   v == null || Number.isNaN(v) ? "–" : Number(v).toFixed(digits).replace(/\.0$/, "");

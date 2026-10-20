@@ -249,3 +249,15 @@ test('compatible recorded history remains available when the current sensor is u
   assert.doesNotMatch(html,/Primary history is unavailable/);
   assert.match(html,/<div class="tile-value">12 µg\/m³<\/div>/);
 });
+
+
+test('practical policy reaches live guidance and suppresses routine humidity and brief secondary spikes',()=>{
+  const card=makeCard({pm25:2,co2:2300,humidity:56});
+  card.setConfig({...card._config,guidance_policy:{profile:'practical'}});
+  const result=card._evaluateGuidance();
+  assert.equal(result.headline,'No current attention flags');
+  assert.equal(result.severity,0);
+  assert.equal(result.flags.length,0);
+  assert.ok(result.readings.some(r=>r.key==='humidity' && r.value===56));
+  assert.equal(card._metric().key,'pm25');
+});
