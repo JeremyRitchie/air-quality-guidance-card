@@ -183,7 +183,7 @@ const READING_LABELS = {
   nox: "NOx index",
 };
 
-const CARD_VERSION = "2.0.1";
+const CARD_VERSION = "2.0.2";
 
 const fmt = (v, digits = 1) =>
   v == null || Number.isNaN(v) ? "–" : Number(v).toFixed(digits).replace(/\.0$/, "");
@@ -889,6 +889,17 @@ export class AirQualityGuidanceCard extends HTMLElement {
     return date.toLocaleTimeString(this._hass?.locale?.language, { hour: "numeric" });
   }
 
+  _historyRangeLabel(start, end) {
+    // Match the axes' browser-local timezone, but keep the complete interval.
+    const formatter = new Intl.DateTimeFormat(this._hass?.locale?.language, {
+      year: "numeric", month: "short", day: "numeric",
+      hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short",
+    });
+    return typeof formatter.formatRange === "function"
+      ? formatter.formatRange(start, end)
+      : `${formatter.format(start)} – ${formatter.format(end)}`;
+  }
+
   _render24hChart(el, stats, metric = this._metric()) {
     // 48 half-hour buckets from 5-minute statistics; hourly fallback.
     const now = Date.now();
@@ -926,8 +937,9 @@ export class AirQualityGuidanceCard extends HTMLElement {
         bars += `<rect x="${(x + 0.75).toFixed(1)}" y="${y(v).toFixed(1)}" width="${(bw - 1.5).toFixed(1)}" height="${h.toFixed(1)}" rx="2" fill="${c.color}" stroke="rgba(0,0,0,.14)" stroke-width="0.5"/>`;
       }
       const when = new Date(t0 + i * bucketMs);
+      const range = this._historyRangeLabel(when, new Date(t0 + (i + 1) * bucketMs));
       hits += `<rect class="hit" x="${x}" y="0" width="${bw}" height="${H - padB}" fill="transparent"
-        data-tip="${v == null ? "no data" : `${fmt(v, metric.decimals)} ${metric.unit} · ${this._catForMetric(metric, v).label}`.trim()} — ${this._hourLabel(when)}"/>`;
+        data-tip="${v == null ? "no data" : `${fmt(v, metric.decimals)} ${metric.unit} · ${this._catForMetric(metric, v).label}`.trim()}&#10;30-minute window: ${esc(range)}"/>`;
     });
 
     const ticks = [0, Math.round(maxV / 2), Math.round(maxV)];
@@ -992,14 +1004,19 @@ export class AirQualityGuidanceCard extends HTMLElement {
   _attachTooltips(scope) {
     const tooltip = this.shadowRoot.querySelector(".tooltip");
     scope.querySelectorAll("[data-tip]").forEach((node) => {
-      node.addEventListener("mouseenter", () => {
+      const position = (ev) => {
+        const { width, height } = tooltip.getBoundingClientRect();
+        tooltip.style.left = `${Math.max(8, Math.min(ev.clientX + 12, window.innerWidth - width - 8))}px`;
+        const top = ev.clientY + 14 + height > window.innerHeight - 8
+          ? ev.clientY - height - 12 : ev.clientY + 14;
+        tooltip.style.top = `${Math.max(8, top)}px`;
+      };
+      node.addEventListener("mouseenter", (ev) => {
         tooltip.textContent = node.dataset.tip;
         tooltip.hidden = false;
+        position(ev);
       });
-      node.addEventListener("mousemove", (ev) => {
-        tooltip.style.left = `${Math.min(ev.clientX + 12, window.innerWidth - 180)}px`;
-        tooltip.style.top = `${ev.clientY + 14}px`;
-      });
+      node.addEventListener("mousemove", position);
       node.addEventListener("mouseleave", () => (tooltip.hidden = true));
     });
   }
@@ -1129,7 +1146,8 @@ export class AirQualityGuidanceCard extends HTMLElement {
     .attribution { margin-top: 18px; font-size: .72rem; color: var(--secondary-text-color, #666); }
     .attribution a { color: inherit; }
     .tooltip {
-      position: fixed; z-index: 10000; pointer-events: none; max-width: 170px;
+      position: fixed; z-index: 10000; pointer-events: none;
+      max-width: min(300px, calc(100vw - 32px)); white-space: pre-line;
       background: rgba(33,33,33,.94); color: #fff; font-size: .74rem;
       padding: 5px 8px; border-radius: 6px;
     }

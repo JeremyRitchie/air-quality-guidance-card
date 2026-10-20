@@ -229,6 +229,85 @@ test('history tooltip is above the opaque modal overlay',()=>{
   assert.ok(overlay>0);assert.ok(tooltip>overlay);
 });
 
+test('history interval labels retain both dates and precise local times across midnight',()=>{
+  const card=makeCard();card._hass.locale={language:'en-GB'};
+  const start=new Date(2026,9,18,23,47,17);
+  const end=new Date(start.getTime()+30*60000);
+  const label=card._historyRangeLabel(start,end);
+  assert.match(label,/18 Oct 2026/);assert.match(label,/19 Oct 2026/);
+  assert.match(label,/23:47:17/);assert.match(label,/0?0:17:17/);
+  const zone=new Intl.DateTimeFormat('en-GB',{timeZoneName:'short'})
+    .formatToParts(start).find(part=>part.type==='timeZoneName').value;
+  assert.ok(label.includes(zone));
+});
+
+test('24-hour bars expose exact half-hour intervals without changing averages or compact axes',()=>{
+  const card=makeCard();card._hass.locale={language:'en-GB'};
+  const now=new Date(2026,9,19,0,42,17).getTime(),start=now-86400000;
+  const clock=Date.now;Date.now=()=>now;
+  const intervals=[],format=card._historyRangeLabel.bind(card);
+  card._historyRangeLabel=(from,to)=>{intervals.push([from.getTime(),to.getTime()]);return format(from,to);};
+  card._attachTooltips=()=>{};
+  const el={innerHTML:''};
+  try {
+    card._render24hChart(el,{short:[
+      {start:start-1,mean:999},
+      {start,mean:2},{start:new Date(start+300000).toISOString(),mean:4},
+      {start:start+1800000,mean:12},{start:now-1,mean:7},{start:now,mean:999},
+    ]});
+  } finally {Date.now=clock;}
+  const tips=[...el.innerHTML.matchAll(/data-tip="([^"]*)"/g)].map(match=>match[1]);
+  assert.equal(tips.length,48);assert.equal(intervals.length,48);
+  intervals.forEach(([from,to],index)=>{
+    assert.equal(from,start+index*1800000);assert.equal(to-from,1800000);
+  });
+  assert.equal(intervals.at(-1)[1],now);
+  assert.equal(tips[0],`3 µg/m³ · Good&#10;30-minute window: ${format(new Date(start),new Date(start+1800000))}`);
+  assert.equal(tips[1],`12 µg/m³ · Moderate&#10;30-minute window: ${format(new Date(start+1800000),new Date(start+3600000))}`);
+  assert.equal(tips[2],`no data&#10;30-minute window: ${format(new Date(start+3600000),new Date(start+5400000))}`);
+  assert.match(tips.at(-1),/^7 µg\/m³ · Good&#10;30-minute window: /);
+  const axes=[...el.innerHTML.matchAll(/<text[^>]*class="axis">([^<]*)<\/text>/g)].map(match=>match[1]);
+  assert.deepEqual(axes,[0,4,8,12,16,20].map(hours=>new Date(start+hours*3600000)
+    .toLocaleTimeString('en-GB',{hour:'numeric'})));
+});
+
+test('history interval labels remain precise when native range formatting is unavailable',()=>{
+  const card=makeCard();card._hass.locale={language:'en-GB'};
+  const start=new Date(2026,9,18,23,47,17),end=new Date(start.getTime()+1800000);
+  const descriptor=Object.getOwnPropertyDescriptor(Intl.DateTimeFormat.prototype,'formatRange');
+  try {
+    Object.defineProperty(Intl.DateTimeFormat.prototype,'formatRange',{...descriptor,value:undefined});
+    const label=card._historyRangeLabel(start,end);
+    assert.match(label,/18 Oct 2026.*23:47:17/);assert.match(label,/19 Oct 2026.*0?0:17:17/);
+  } finally {Object.defineProperty(Intl.DateTimeFormat.prototype,'formatRange',descriptor);}
+});
+
+test('long history tooltips stay visible at viewport edges and hide on pointer leave',()=>{
+  const card=makeCard(),listeners=new Map();
+  const tooltip={hidden:true,textContent:'',style:{},getBoundingClientRect(){
+    assert.equal(this.hidden,false);return {width:300,height:70};
+  }};
+  const hit={dataset:{tip:'3 µg/m³ · Good\n30-minute window: 18 Oct 2026, 23:47:17 – 19 Oct 2026, 00:17:17'},
+    addEventListener:(event,listener)=>listeners.set(event,listener)};
+  card.shadowRoot={querySelector:()=>tooltip};
+  card._attachTooltips({querySelectorAll:()=>[hit]});
+  const width=window.innerWidth,height=window.innerHeight;
+  window.innerWidth=390;window.innerHeight=720;
+  try {
+    listeners.get('mouseenter')({clientX:380,clientY:700});
+    assert.equal(tooltip.hidden,false);assert.equal(tooltip.textContent,hit.dataset.tip);
+    assert.equal(tooltip.style.left,'82px');assert.equal(tooltip.style.top,'618px');
+    listeners.get('mousemove')({clientX:20,clientY:30});
+    assert.equal(tooltip.style.left,'32px');assert.equal(tooltip.style.top,'44px');
+    listeners.get('mousemove')({clientX:-10,clientY:-20});
+    assert.equal(tooltip.style.left,'8px');assert.equal(tooltip.style.top,'8px');
+    listeners.get('mouseleave')();assert.equal(tooltip.hidden,true);
+  } finally {
+    if(width===undefined)delete window.innerWidth;else window.innerWidth=width;
+    if(height===undefined)delete window.innerHeight;else window.innerHeight=height;
+  }
+});
+
 test('incompatible history is neither fetched nor displayed under a false metric unit',async()=>{
   const card=makeCard({pm25:2,co2:700});let ids=[];
   card._hass.states[entity('pm25')].attributes.unit_of_measurement='ppm';

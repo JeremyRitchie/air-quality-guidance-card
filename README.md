@@ -1,16 +1,18 @@
 # Air Quality Guidance Card
 
-A Home Assistant dashboard card that keeps the artwork and recorded-history views of [keranm/air-quality-scene-card](https://github.com/keranm/air-quality-scene-card), while giving the headline and mascot guidance from the available readings on the device. Fork version **2.0.1**, based on upstream **1.3.1**. MIT attribution and the original bundle are retained.
+A Home Assistant dashboard card that keeps the artwork and recorded-history views of [keranm/air-quality-scene-card](https://github.com/keranm/air-quality-scene-card), while giving the headline and mascot guidance from the available readings on the device. Fork version **2.0.2**, based on upstream **1.3.1**. MIT attribution and the original bundle are retained.
 
 The headline can respond to PM2.5, PM10, CO₂, relative VOC/NOx events and humidity. PM1, PM4 and temperature remain useful context without invented health cutoffs. A hidden chip still participates in guidance. “No sensor flags” means no configured rule is currently flagged; it is **not a composite AQI, health score or assurance that every pollutant is low**.
 
+The 24-hour bar-chart tooltips show the date and exact start–end time of each rolling 30-minute window, including seconds and the local timezone. A bar summarizes recorded statistics within that interval; it is not an individual sensor sample. Compact axis labels remain unchanged.
+
 ## Install alongside the original
 
-Add `https://github.com/JeremyRitchie/air-quality-guidance-card` as a HACS custom **Dashboard** repository. Download version 2.0.1 and reload the browser. HACS uses the explicit `air-quality-guidance-card.js` filename in `hacs.json`.
+Add `https://github.com/JeremyRitchie/air-quality-guidance-card` as a HACS custom **Dashboard** repository. Download version 2.0.2 and reload the browser. HACS uses the explicit `air-quality-guidance-card.js` filename in `hacs.json`.
 
 The new type is `custom:air-quality-guidance-card`, with a distinct editor. Keep the original resource if other views still use `custom:air-quality-scene-card`; there is no load-order conflict. The original `dist/air-quality-scene-card.js` remains unchanged for reference/rollback, but the resource to register for this fork is **`dist/air-quality-guidance-card.js`**.
 
-Manual alternative: copy the new bundle to `/config/www/air-quality-guidance-card.js`, register `/local/air-quality-guidance-card.js?v=2.0.1` as a JavaScript module, and reload the browser. No backend integration or HA restart is required.
+Manual alternative: copy the new bundle to `/config/www/air-quality-guidance-card.js`, register `/local/air-quality-guidance-card.js?v=2.0.2` as a JavaScript module, and reload the browser. No backend integration or HA restart is required.
 
 ```yaml
 type: custom:air-quality-guidance-card
