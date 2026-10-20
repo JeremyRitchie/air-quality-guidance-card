@@ -183,7 +183,7 @@ const READING_LABELS = {
   nox: "NOx index",
 };
 
-const CARD_VERSION = "2.0.2";
+const CARD_VERSION = "2.0.3";
 
 const fmt = (v, digits = 1) =>
   v == null || Number.isNaN(v) ? "–" : Number(v).toFixed(digits).replace(/\.0$/, "");
@@ -890,14 +890,15 @@ export class AirQualityGuidanceCard extends HTMLElement {
   }
 
   _historyRangeLabel(start, end) {
-    // Match the axes' browser-local timezone, but keep the complete interval.
-    const formatter = new Intl.DateTimeFormat(this._hass?.locale?.language, {
-      year: "numeric", month: "short", day: "numeric",
-      hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short",
+    // Match the axes' local timezone; show the date once unless midnight is crossed.
+    const locale = this._hass?.locale?.language;
+    const date = new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" });
+    const time = new Intl.DateTimeFormat(locale, {
+      hour: "2-digit", minute: "2-digit", hourCycle: "h23",
     });
-    return typeof formatter.formatRange === "function"
-      ? formatter.formatRange(start, end)
-      : `${formatter.format(start)} – ${formatter.format(end)}`;
+    const endLabel = start.toDateString() === end.toDateString()
+      ? time.format(end) : `${date.format(end)} ${time.format(end)}`;
+    return `${date.format(start)} · ${time.format(start)}–${endLabel}`;
   }
 
   _render24hChart(el, stats, metric = this._metric()) {
@@ -939,7 +940,7 @@ export class AirQualityGuidanceCard extends HTMLElement {
       const when = new Date(t0 + i * bucketMs);
       const range = this._historyRangeLabel(when, new Date(t0 + (i + 1) * bucketMs));
       hits += `<rect class="hit" x="${x}" y="0" width="${bw}" height="${H - padB}" fill="transparent"
-        data-tip="${v == null ? "no data" : `${fmt(v, metric.decimals)} ${metric.unit} · ${this._catForMetric(metric, v).label}`.trim()}&#10;30-minute window: ${esc(range)}"/>`;
+        data-tip="${v == null ? "no data" : `${fmt(v, metric.decimals)} ${metric.unit} · ${this._catForMetric(metric, v).label}`.trim()}&#10;${esc(range)}"/>`;
     });
 
     const ticks = [0, Math.round(maxV / 2), Math.round(maxV)];

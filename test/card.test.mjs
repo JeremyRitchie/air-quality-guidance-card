@@ -229,16 +229,13 @@ test('history tooltip is above the opaque modal overlay',()=>{
   assert.ok(overlay>0);assert.ok(tooltip>overlay);
 });
 
-test('history interval labels retain both dates and precise local times across midnight',()=>{
+test('compact history intervals retain both dates across midnight and omit seconds',()=>{
   const card=makeCard();card._hass.locale={language:'en-GB'};
   const start=new Date(2026,9,18,23,47,17);
   const end=new Date(start.getTime()+30*60000);
   const label=card._historyRangeLabel(start,end);
-  assert.match(label,/18 Oct 2026/);assert.match(label,/19 Oct 2026/);
-  assert.match(label,/23:47:17/);assert.match(label,/0?0:17:17/);
-  const zone=new Intl.DateTimeFormat('en-GB',{timeZoneName:'short'})
-    .formatToParts(start).find(part=>part.type==='timeZoneName').value;
-  assert.ok(label.includes(zone));
+  assert.match(label,/18 Oct.*23:47.*19 Oct.*00:17/);
+  assert.doesNotMatch(label,/:\d{2}:\d{2}|2026|GMT|UTC|window/);
 });
 
 test('24-hour bars expose exact half-hour intervals without changing averages or compact axes',()=>{
@@ -262,24 +259,25 @@ test('24-hour bars expose exact half-hour intervals without changing averages or
     assert.equal(from,start+index*1800000);assert.equal(to-from,1800000);
   });
   assert.equal(intervals.at(-1)[1],now);
-  assert.equal(tips[0],`3 µg/m³ · Good&#10;30-minute window: ${format(new Date(start),new Date(start+1800000))}`);
-  assert.equal(tips[1],`12 µg/m³ · Moderate&#10;30-minute window: ${format(new Date(start+1800000),new Date(start+3600000))}`);
-  assert.equal(tips[2],`no data&#10;30-minute window: ${format(new Date(start+3600000),new Date(start+5400000))}`);
-  assert.match(tips.at(-1),/^7 µg\/m³ · Good&#10;30-minute window: /);
+  assert.equal(tips[0],`3 µg/m³ · Good&#10;${format(new Date(start),new Date(start+1800000))}`);
+  assert.equal(tips[1],`12 µg/m³ · Moderate&#10;${format(new Date(start+1800000),new Date(start+3600000))}`);
+  assert.equal(tips[2],`no data&#10;${format(new Date(start+3600000),new Date(start+5400000))}`);
+  assert.match(tips.at(-1),/^7 µg\/m³ · Good&#10;/);
+  tips.forEach(tip=>{
+    assert.equal(tip.split('&#10;').length,2);
+    assert.doesNotMatch(tip,/:\d{2}:\d{2}|2026|GMT|UTC|window/);
+  });
   const axes=[...el.innerHTML.matchAll(/<text[^>]*class="axis">([^<]*)<\/text>/g)].map(match=>match[1]);
   assert.deepEqual(axes,[0,4,8,12,16,20].map(hours=>new Date(start+hours*3600000)
     .toLocaleTimeString('en-GB',{hour:'numeric'})));
 });
 
-test('history interval labels remain precise when native range formatting is unavailable',()=>{
-  const card=makeCard();card._hass.locale={language:'en-GB'};
-  const start=new Date(2026,9,18,23,47,17),end=new Date(start.getTime()+1800000);
-  const descriptor=Object.getOwnPropertyDescriptor(Intl.DateTimeFormat.prototype,'formatRange');
-  try {
-    Object.defineProperty(Intl.DateTimeFormat.prototype,'formatRange',{...descriptor,value:undefined});
-    const label=card._historyRangeLabel(start,end);
-    assert.match(label,/18 Oct 2026.*23:47:17/);assert.match(label,/19 Oct 2026.*0?0:17:17/);
-  } finally {Object.defineProperty(Intl.DateTimeFormat.prototype,'formatRange',descriptor);}
+test('same-day history intervals show one short date and 24-hour minute times in either English locale',()=>{
+  const card=makeCard(),start=new Date(2026,9,19,15,36,17),end=new Date(start.getTime()+1800000);
+  card._hass.locale={language:'en-GB'};
+  assert.equal(card._historyRangeLabel(start,end),'19 Oct · 15:36–16:06');
+  card._hass.locale={language:'en-US'};
+  assert.equal(card._historyRangeLabel(start,end),'Oct 19 · 15:36–16:06');
 });
 
 test('long history tooltips stay visible at viewport edges and hide on pointer leave',()=>{
@@ -287,7 +285,7 @@ test('long history tooltips stay visible at viewport edges and hide on pointer l
   const tooltip={hidden:true,textContent:'',style:{},getBoundingClientRect(){
     assert.equal(this.hidden,false);return {width:300,height:70};
   }};
-  const hit={dataset:{tip:'3 µg/m³ · Good\n30-minute window: 18 Oct 2026, 23:47:17 – 19 Oct 2026, 00:17:17'},
+  const hit={dataset:{tip:'3 µg/m³ · Good\n19 Oct · 15:36–16:06'},
     addEventListener:(event,listener)=>listeners.set(event,listener)};
   card.shadowRoot={querySelector:()=>tooltip};
   card._attachTooltips({querySelectorAll:()=>[hit]});
