@@ -121,11 +121,57 @@ test('visual editor keeps YAML guidance policy and unrelated card-mod settings',
   assert.equal(saved.card_mod.style,'custom');assert.equal(saved.co2,entity('co2'));
 });
 
-test('drawer guidance names actual readings, coverage and safe authoritative links',()=>{
-  const card=makeCard();const result=card._evaluateGuidance();const html=card._guidanceDetails(result);
-  assert.match(html,/CO₂/);assert.match(html,/0 \/ 288/);
-  assert.match(html,/not a composite AQI/);assert.match(html,/https:\/\/www\.who\.int/);
-  assert.doesNotMatch(html,/javascript:/);
+test('drawer readings are compact label-value pairs with no repeated interpretation or status notes',()=>{
+  const card=makeCard(),result=card._evaluateGuidance();
+  assert.equal(result.coverage.pm25.availableBuckets,0);
+  assert.equal(result.coverage.pm25.expectedBuckets,288);
+  result.headline='SUPPRESSED_HEADLINE';result.advice='SUPPRESSED_ADVICE';
+  result.flags=[{headline:'SUPPRESSED_FLAG',basis:'SUPPRESSED_BASIS',referenceUrl:'https://example.com/source'}];
+  result.readings.forEach(reading=>{
+    reading.reason='SUPPRESSED_REASON';reading.basis='SUPPRESSED_BASIS';reading.average24h=9999;
+  });
+  card._guidanceStatsError=true;
+  const html=card._guidanceDetails(result);
+  const pairs=[...html.matchAll(/<li[^>]*>\s*<strong>([^<]*)<\/strong>\s*<span class="reading-value">([^<]*)<\/span>\s*<\/li>/g)]
+    .map(match=>[match[1],match[2]]).sort();
+  assert.deepEqual(pairs,[['Temperature','21 °C'],['Humidity','40 %'],['CO₂','700 ppm'],
+    ['PM2.5','2 µg/m³'],['PM1','1 µg/m³'],['PM4','3 µg/m³'],['PM10','5 µg/m³'],
+    ['VOC index','80'],['NOx index','1']].sort());
+  assert.equal([...html.matchAll(/<li\b/g)].length,9);
+  assert.match(html,/>Readings<\//);
+  assert.doesNotMatch(html,/SUPPRESSED|9999|Current:|Current reading available|Context and trend|Relative to the sensor|Guidelines and interpretation|Recorded 5-minute means|24 h mean|Driven by|not a composite|guidance-(?:flags|references|basis)|\b(?:ok|watch|flag)\b|href=|<p\b|<details\b/i);
+});
+
+test('compact readings suppress invalid, stale, unavailable and missing sensor numbers',()=>{
+  const cases=[
+    state=>{state.state='-1';},
+    state=>{state.state='7777';state.attributes.unit_of_measurement='µg/m³';},
+    state=>{state.state='1888';state.last_reported='2001-01-01T00:00:00Z';},
+    state=>{state.state='';},
+    state=>{state.state='unavailable';},
+    (state,card)=>{delete card._hass.states[entity('co2')];},
+  ];
+  for(const change of cases) {
+    const card=makeCard({pm25:0,co2:700});change(card._hass.states[entity('co2')],card);
+    const html=card._guidanceDetails(card._evaluateGuidance());
+    const row=[...html.matchAll(/<li[^>]*>(.*?)<\/li>/gs)].find(match=>match[1].includes('<strong>CO₂</strong>'))?.[1];
+    assert.ok(row);assert.match(row,/<span class="reading-value">/);
+    const text=row.replace(/<[^>]*>/g,'').replace(/\s+/g,' ').trim();
+    assert.match(text,/–/);assert.match(text,/\b(?:invalid|stale|unavailable)\b/i);
+    assert.doesNotMatch(text,/\d|ppm|Current:|Sensor is|reported timestamp/);
+    assert.ok(text.length<40);
+    assert.match(html,/<strong>PM2\.5<\/strong>\s*<span class="reading-value">0 µg\/m³<\/span>/);
+  }
+});
+
+test('compact reading labels and unit text are escaped while their semantic elements remain intact',()=>{
+  const card=makeCard();
+  const html=card._guidanceDetails({readings:{
+    '<img src=x onerror="alert(1)">':{status:'ok',value:12.3,unit:'u<&"'},
+  }});
+  assert.match(html,/<strong>&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;<\/strong>/);
+  assert.match(html,/<span class="reading-value">12\.3 u&lt;&amp;&quot;<\/span>/);
+  assert.doesNotMatch(html,/<img\b|<script\b|\bonerror="|\bok\b/);
 });
 
 test('disconnect restores owned scroll lock and removes modal state',()=>{
@@ -174,7 +220,7 @@ test('drawer headline follows elevated secondary guidance with primary number se
   assert.match(html,/<div class="sheet-cat">Watch CO₂<\/div>/);
   assert.doesNotMatch(html,/<div class="sheet-cat">Good<\/div>/);
   assert.match(html,/<div class="sheet-pm">.*<b>2<\/b> µg\/m³<\/div>/);
-  assert.match(html,/Current: 1800 ppm/);
+  assert.match(html,/<strong>CO₂<\/strong>\s*<span class="reading-value">1800 ppm<\/span>/);
 });
 
 test('missing primary keeps valid secondary charts and a truthful drawer headline',()=>{
@@ -190,9 +236,21 @@ test('drawer recorded mean ignores invalid rows and parses numeric means',()=>{
   card._stats={short:[{start,mean:'10'},{start:start+300000,mean:'30'},
     {start:start+300000,mean:'bad'},{start:start+300000,mean:''}],hourly:[],daily:[]};
   const html=renderDrawer(card);
-  assert.match(html,/<div class="tile-title">Last 24 h<\/div>\s*<div class="tile-value">20 µg\/m³<\/div>/);
-  const guidance=card._evaluateGuidance();guidance.readings[0].average24h=12;
-  assert.match(card._guidanceDetails(guidance),/24 h mean: 12 µg\/m³/);
+  assert.deepEqual([...html.matchAll(/<div class="tile-title">([^<]*)<\/div>/g)].map(match=>match[1]),
+    ['24 h mean','12 h mean','24 h peak']);
+  assert.deepEqual([...html.matchAll(/<div class="tile-value">([^<]*)<\/div>/g)].map(match=>match[1]),
+    ['20 µg/m³','20 µg/m³','30 µg/m³']);
+  assert.doesNotMatch(html,/class="tile-sub"|class="attribution"|Complete 24-hour mean|Relative gas index|Recorded maximum;|mean of available/);
+});
+
+test('data-only summary tiles use dashes while recorded history is missing',()=>{
+  const card=makeCard({pm25:2,voc:80});
+  card.setConfig({...card._config,entity:entity('voc'),metric:'voc'});
+  const html=renderDrawer(card);
+  assert.deepEqual([...html.matchAll(/<div class="tile-title">([^<]*)<\/div>/g)].map(match=>match[1]),
+    ['24 h mean','12 h mean','24 h peak']);
+  assert.deepEqual([...html.matchAll(/<div class="tile-value">([^<]*)<\/div>/g)].map(match=>match[1]),['–','–','–']);
+  assert.doesNotMatch(html,/class="tile-sub"|class="attribution"|Not a concentration|Collecting data|Learned background and event signal/);
 });
 
 test('legacy primary-only mode stays offline when its selected reading is unavailable',()=>{

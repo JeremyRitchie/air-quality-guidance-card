@@ -1,6 +1,6 @@
 # Air Quality Guidance Card
 
-A Home Assistant dashboard card that keeps the artwork and recorded-history views of [keranm/air-quality-scene-card](https://github.com/keranm/air-quality-scene-card), while giving the headline and mascot guidance from the available readings on the device. Fork version **2.0.3**, based on upstream **1.3.1**. MIT attribution and the original bundle are retained.
+A Home Assistant dashboard card that keeps the artwork and recorded-history views of [keranm/air-quality-scene-card](https://github.com/keranm/air-quality-scene-card), while giving the headline and mascot guidance from the available readings on the device. Fork version **2.0.4**, based on upstream **1.3.1**. MIT attribution and the original bundle are retained.
 
 The headline can respond to PM2.5, PM10, CO₂, relative VOC/NOx events and humidity. PM1, PM4 and temperature remain useful context without invented health cutoffs. A hidden chip still participates in guidance. “No sensor flags” means no configured rule is currently flagged; it is **not a composite AQI, health score or assurance that every pollutant is low**.
 
@@ -8,11 +8,11 @@ The 24-hour bar-chart tooltips use two compact lines: the reading/category, then
 
 ## Install alongside the original
 
-Add `https://github.com/JeremyRitchie/air-quality-guidance-card` as a HACS custom **Dashboard** repository. Download version 2.0.3 and reload the browser. HACS uses the explicit `air-quality-guidance-card.js` filename in `hacs.json`.
+Add `https://github.com/JeremyRitchie/air-quality-guidance-card` as a HACS custom **Dashboard** repository. Download version 2.0.4 and reload the browser. HACS uses the explicit `air-quality-guidance-card.js` filename in `hacs.json`.
 
 The new type is `custom:air-quality-guidance-card`, with a distinct editor. Keep the original resource if other views still use `custom:air-quality-scene-card`; there is no load-order conflict. The original `dist/air-quality-scene-card.js` remains unchanged for reference/rollback, but the resource to register for this fork is **`dist/air-quality-guidance-card.js`**.
 
-Manual alternative: copy the new bundle to `/config/www/air-quality-guidance-card.js`, register `/local/air-quality-guidance-card.js?v=2.0.3` as a JavaScript module, and reload the browser. No backend integration or HA restart is required.
+Manual alternative: copy the new bundle to `/config/www/air-quality-guidance-card.js`, register `/local/air-quality-guidance-card.js?v=2.0.4` as a JavaScript module, and reload the browser. No backend integration or HA restart is required.
 
 ```yaml
 type: custom:air-quality-guidance-card
@@ -64,7 +64,7 @@ Every expected five-minute mean must meet a persistence gate; a single spike can
 * **Humidity:** 30–50% RH comes from Health Canada moisture guidance. The complete 30-minute trend is a local display choice. Cold surfaces may require lower indoor humidity to avoid condensation. Temperature is context only.
 * **Evidence and gaps:** a current value alone produces provisional/watch wording. A recent complete five-minute mean can confirm a sampled trend, which is not proof of continuous exposure. Complete 24-hour evidence remains useful even if the current reading is unavailable. Missing, stale, nonfinite and incompatible-unit readings are not converted into zeros or reassuring flags. `last_updated` alone is never used to declare an unchanged sensor stale.
 
-The drawer explains the driver, available/missing readings, recorded coverage and sources. Historical colour bands are retained as **visual context**, not an official AQI or validated continuous exposure estimate. The old “cigarettes smoked” metaphor and comparison of a short average against an annual guideline have been removed.
+The drawer shows a compact label/value list of current readings, three recorded-history summaries (24 h mean, 12 h mean, 24 h peak), and the existing charts. Repeated status/reason paragraphs and the Guidelines and interpretation section are omitted. Missing, invalid or stale readings display a dash with a short status. Historical colour bands are retained as **visual context**, not an official AQI or validated continuous exposure estimate. The old “cigarettes smoked” metaphor and comparison of a short average against an annual guideline have been removed.
 
 Primary references:
 
@@ -79,7 +79,7 @@ Primary references:
 
 While the card is visible, it requests one batched HA recorder query at most every five minutes for PM2.5, PM10, CO₂, humidity, VOC and NOx five-minute statistics. That request covers one aligned 24-hour window, not ten days. Opening the drawer separately loads the original longer history views. Recorder failures leave averages unavailable; an old async response cannot populate a changed card configuration. Charts begin empty and fill as HA records the new device.
 
-All reads stay inside the existing authenticated HA connection. The card calls no device service, creates no entities/automations/notifications and sends no measurements to outside servers. Reference links open only when selected. Timers, observers, keyboard listeners and owned body-scroll locks are cleaned up on disconnect. Close is a 44px target, Escape closes, and the original `.scene`, `.overlay`, `.backdrop` and `.sheet` selectors remain available for themes.
+All reads stay inside the existing authenticated HA connection. The card calls no device service, creates no entities/automations/notifications and sends no measurements to outside servers. Reference documentation stays in this README. Timers, observers, keyboard listeners and owned body-scroll locks are cleaned up on disconnect. Close is a 44px target, Escape closes, and the original `.scene`, `.overlay`, `.backdrop` and `.sheet` selectors remain available for themes.
 
 Theme integration: a fixed overlay can be trapped by `isolation:isolate`, transforms, filters or containment on a structural ancestor. Keep **transparent structural wrappers** free of those stacking boundaries; ordinary leaf glass surfaces can remain. The drawer needs an opaque surface and an overlay above the dashboard/HA toolbar. Verify both desktop and phone hit-testing after a theme change. Do not mask a stacking failure with transparency or test by clicking a real device behind it.
 

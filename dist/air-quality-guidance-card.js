@@ -584,7 +584,7 @@ const READING_LABELS = {
   nox: "NOx index",
 };
 
-const CARD_VERSION = "2.0.3";
+const CARD_VERSION = "2.0.4";
 
 const fmt = (v, digits = 1) =>
   v == null || Number.isNaN(v) ? "–" : Number(v).toFixed(digits).replace(/\.0$/, "");
@@ -612,11 +612,6 @@ const cardGuidanceVisual = guidance => {
   const level = Math.max(0, Math.min(3, Number(guidance.severity) || 0));
   const base = PM25_CATEGORIES[level];
   return { ...base, mood: { calm: "happy", watch: "meh", act: "sad" }[guidance.mood] ?? base.mood };
-};
-
-const cardSafeLink = raw => {
-  try { const url = new URL(raw); return ["https:", "http:"].includes(url.protocol) ? esc(url.href) : ""; }
-  catch { return ""; }
 };
 
 export class AirQualityGuidanceCard extends HTMLElement {
@@ -884,41 +879,20 @@ export class AirQualityGuidanceCard extends HTMLElement {
 
   _guidanceDetails(guidance) {
     const entries = Array.isArray(guidance.readings) ? guidance.readings.map(item => [item.key, item]) : Object.entries(guidance.readings ?? {});
-    const flags = guidance.flags ?? [];
-    const references = new Map();
-    for (const item of [...Object.values(DEFAULT_POLICY.sources ?? {}), ...flags,
-        ...entries.map(([, value]) => value)]) {
-      const url = typeof item === "string" ? item : item?.referenceUrl ?? item?.url;
-      const link = cardSafeLink(url);
-      if (link) references.set(link, typeof item === "string" ? url :
-        item.reference ?? item.label ?? item.name ?? url);
-    }
-    const driver = guidance.driver ? READING_LABELS[guidance.driver] ?? guidance.driver : null;
     const list = entries.map(([key, item]) => {
       const status = item.status ?? "unavailable";
-      const current = !["invalid", "stale"].includes(status) ? cardFiniteReading(item.value) : null;
+      const current = !["invalid", "stale", "unavailable"].includes(status)
+        ? cardFiniteReading(item.value) : null;
       const unit = item.unit ? ` ${item.unit}` : "";
-      const coverage = guidance.coverage?.[key];
-      const count = coverage?.availableBuckets;
-      const expected = coverage?.expectedBuckets;
-      return `<li><strong>${esc(READING_LABELS[key] ?? key)}</strong> · ${esc(status)}
-        <span>Current: ${current == null ? "–" : esc(fmt(current, 1) + unit)}</span>
-        <span>${esc(item.reason ?? item.basis ?? "")}</span>
-        ${item.average24h != null ? `<span>24 h mean: ${esc(fmt(item.average24h, 1) + unit)}</span>` : ""}
-        ${count != null ? `<span>Recorded 5-minute means: ${esc(count)} / ${esc(expected)}</span>` : ""}</li>`;
+      const missing = status === "stale" ? "Stale" :
+        status === "invalid" && item.reason !== "Sensor is unavailable." ? "Invalid" : "Unavailable";
+      return `<li><strong>${esc(READING_LABELS[key] ?? key)}</strong>
+        <span class="reading-value">${current == null
+          ? `– <small class="reading-status">${missing}</small>`
+          : esc(fmt(current, 1) + unit)}</span></li>`;
     }).join("");
-    return `<section class="guidance-details" aria-label="Guidance from available readings">
-      <h2>${esc(guidance.headline)}</h2><p>${esc(guidance.advice)}</p>
-      <p class="guidance-basis">${driver ? `Driven by ${esc(driver)}. ` : ""}
-        ${guidance.partial ? "Some readings or averaging periods are incomplete. " : ""}
-        Sensor guidance, not a composite AQI or an assurance that the room is safe.</p>
-      ${this._guidanceStatsError ? '<p>Recorded averages unavailable; current readings are screening information only.</p>' : ""}
-      <ul class="guidance-readings">${list}</ul>
-      ${flags.length ? `<ul class="guidance-flags">${flags.map(flag => `<li><strong>${esc(flag.headline ?? READING_LABELS[flag.key] ?? flag.key)}</strong>: ${esc(flag.basis ?? flag.advice ?? "")}</li>`).join("")}</ul>` : ""}
-      <details class="guidance-references"><summary>Guidelines and interpretation</summary>
-        <p>24-hour comparisons require 288 complete recorded 5-minute means. Sample means are not proof of continuous exposure. Current values are clearly labelled screening values. VOC/NOx indices are relative gas indicators, not concentrations or health limits. PM1 and PM4 are context, without borrowed PM2.5 health categories. Any PM0.3 particle count is also context only.</p>
-        <ul>${[...references].map(([url, label]) => `<li><a href="${url}" target="_blank" rel="noopener noreferrer">${esc(label)}</a></li>`).join("")}</ul>
-      </details></section>`;
+    return `<section class="guidance-details" aria-label="Current readings">
+      <h2>Readings</h2><ul class="guidance-readings">${list}</ul></section>`;
   }
 
   getCardSize() {
@@ -1203,27 +1177,13 @@ export class AirQualityGuidanceCard extends HTMLElement {
     const avg12 = meanOfLast(fine, 12 * 3600e3);
 
     const name = esc(this.shadowRoot.querySelector(".name").textContent);
-    const tile = (title, value, sub) => `
+    const tile = (title, value) => `
       <div class="tile">
         <div class="tile-title">${title}</div>
-        <div class="tile-value">${value}</div>
-        <div class="tile-sub">${sub}</div>
+        <div class="tile-value">${value == null ? "–" : `${fmt(value, metric.decimals)} ${metric.unit}`.trim()}</div>
       </div>`;
-    const pending = (title) => tile(title, "…", "Collecting data — check back soon");
-
     const rows24 = rowsOfLast(fine, 24 * 3600e3).filter(row => cardFiniteReading(row.max ?? row.mean) != null);
     const peak24 = rows24.length ? Math.max(...rows24.map(row => Number(row.max ?? row.mean))) : null;
-    const assessment = Array.isArray(guidance.readings) ? guidance.readings.find(item => item.key === metric.key) : guidance.readings?.[metric.key];
-    const coverage = guidance.coverage?.[metric.key];
-    const peakTile = peak24 == null ? pending("Peak recorded — last 24 h") : tile(
-      "Peak recorded — last 24 h", `${fmt(peak24, metric.decimals)} ${metric.unit}`.trim(),
-      "Recorded maximum; not a continuous-exposure or health category");
-    const dailyTile = ["pm25", "pm10", "co2"].includes(metric.key)
-      ? tile("Complete 24-hour mean", assessment?.average24h == null ? "…" :
-          `${fmt(assessment.average24h, metric.decimals)} ${metric.unit}`.trim(),
-          `${coverage?.availableBuckets ?? 0} / ${coverage?.expectedBuckets ?? 288} complete 5-minute means. ${assessment?.average24h == null ? "Collecting data; no guideline comparison yet." : "See guidance and reference above."}`)
-      : tile("Relative gas index", "Not a concentration", "Learned background and event signal; not a gas exposure limit");
-    const extraTiles = peakTile + dailyTile;
 
     overlay.innerHTML = `
       <div class="backdrop"></div>
@@ -1240,9 +1200,9 @@ export class AirQualityGuidanceCard extends HTMLElement {
         ${this._config.guidance === "primary" ? "" : this._guidanceDetails(guidance)}
         ${historyCompatible ? "" : '<p class="guidance-basis">Primary history is unavailable: its measurement unit is missing or incompatible with the selected metric.</p>'}
         <div class="tiles">
-          ${tile("Last 24 h", avg24 == null ? "…" : `${fmt(avg24, metric.decimals)} ${metric.unit}`.trim(), `mean of available ${metric.short} samples; may be incomplete`)}
-          ${tile("Last 12 h", avg12 == null ? "…" : `${fmt(avg12, metric.decimals)} ${metric.unit}`.trim(), `mean of available ${metric.short} samples; may be incomplete`)}
-          ${extraTiles}
+          ${tile("24 h mean", avg24)}
+          ${tile("12 h mean", avg12)}
+          ${tile("24 h peak", peak24)}
         </div>
         <div class="section">
           <h3>${metric.labelHtml} — last 24 hours <span class="unit">${metric.unit}</span></h3>
@@ -1264,7 +1224,7 @@ export class AirQualityGuidanceCard extends HTMLElement {
         </div>`;
           })
           .join("")}
-        <div class="attribution">${metric.attribution}</div>
+
       </div>`;
 
     overlay.querySelector(".backdrop").addEventListener("click", () => this._closeOverlay());
@@ -1432,17 +1392,21 @@ export class AirQualityGuidanceCard extends HTMLElement {
       overflow: hidden; color: rgba(0,0,0,.78); }
     .guidance:empty { display: none; }
     .guidance-details { border: 1px solid var(--divider-color,#ddd); border-radius: 12px;
-      padding: 12px; margin-bottom: 16px; }
-    .guidance-details h2 { font-size: 1.15rem; margin: 0 0 6px; }
-    .guidance-details p { margin: 6px 0; }
+      padding: 10px 12px; margin-bottom: 12px; }
+    .guidance-details h2 { font-size: .85rem; font-weight: 600; margin: 0 0 6px;
+      color: var(--secondary-text-color,#666); }
     .guidance-basis { font-size: .85rem; color: var(--secondary-text-color,#666); }
-    .guidance-readings { list-style: none; padding: 0; }
-    .guidance-readings li { margin: 10px 0; }
-    .guidance-readings span { display: block; font-size: .82rem; }
-    .guidance-references summary { min-height: 44px; display: flex; align-items: center;
-      cursor: pointer; }
-    .guidance-references a { display: inline-flex; align-items: center; min-height: 44px;
-      color: var(--primary-color,#1565c0); overflow-wrap: anywhere; }
+    .guidance-readings { list-style: none; padding: 0; margin: 0; display: grid;
+      grid-template-columns: repeat(2,minmax(0,1fr)); column-gap: 24px; }
+    .guidance-readings li { display: flex; align-items: baseline; justify-content: space-between;
+      min-width: 0; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--divider-color,#ddd); }
+    .guidance-readings strong { font-size: .85rem; font-weight: 400; }
+    .reading-value { font-size: .9rem; font-weight: 600; white-space: nowrap;
+      text-align: right; font-variant-numeric: tabular-nums; }
+    .reading-status { font-size: .7rem; font-weight: 400; color: var(--secondary-text-color,#666); }
+    @media (max-width: 480px) {
+      .guidance-readings { grid-template-columns: minmax(0,1fr); }
+    }
 
     :host { display: block; }
     ha-card { overflow: hidden; }
@@ -1524,7 +1488,6 @@ export class AirQualityGuidanceCard extends HTMLElement {
     .tile { background: var(--secondary-background-color, #f5f5f5); border-radius: 12px; padding: 12px; }
     .tile-title { font-size: .8rem; color: var(--secondary-text-color, #666); }
     .tile-value { font-size: 1.4rem; font-weight: 700; margin: 2px 0; }
-    .tile-sub { font-size: .75rem; color: var(--secondary-text-color, #666); }
     .section { margin-top: 20px; }
     .section h3 { font-size: .95rem; margin: 0 0 8px; }
     .subhead { font-size: 1.05rem; margin: 26px 0 0; padding-top: 18px;
